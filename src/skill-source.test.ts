@@ -59,3 +59,43 @@ test('the canonical skill declares the name and the rules an agent is loaded for
     expect(text).toContain(tool)
   }
 })
+
+/**
+ * The re-arm rule is load-bearing, not decoration: after a reboot four agents
+ * came back with their MCP server up and no listener, and stayed deaf for
+ * hours because nothing told them to start one. This asserts the CONTRACT —
+ * that the skill still names every watcher state, both harnesses' re-arm
+ * command, and the instruction to do it without waiting for approval — not the
+ * prose that carries it.
+ */
+test('the canonical skill still tells the agent to re-arm its own listener', async () => {
+  const text = await Bun.file(CANONICAL).text()
+
+  // The signal an agent has to read, and every value it can come back with.
+  expect(text).toContain('watcher.state')
+  for (const state of ['listening', 'retrying', 'stopped', 'stale', 'absent']) {
+    expect(text).toContain(`\`${state}\``)
+  }
+  // `health: live` proves the credential, never that anything is listening.
+  expect(text).toContain('health: live')
+
+  // The rule, and the command for each harness that can act on it.
+  expect(text).toMatch(/re-arm/i)
+  expect(text).toContain('/mattermost restart')
+  expect(text).toMatch(/Claude Code/)
+
+  // And the two cases where a second listener is the wrong answer.
+  expect(text).toContain('lock-held')
+})
+
+test('the plugin monitor description carries the re-arm rule too', async () => {
+  const monitors = (await Bun.file(
+    join(ROOT, 'adapters', 'claude-plugin', 'monitors', 'monitors.json'),
+  ).json()) as { name: string; description: string }[]
+
+  // Claude Code shows this string, and does not restart a killed monitor on
+  // its own — so it is the first place an agent can learn the rule.
+  const monitor = monitors.find((entry) => entry.name === 'mattermost-events')
+  expect(monitor).toBeDefined()
+  expect(monitor?.description).toMatch(/re-arm/i)
+})

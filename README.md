@@ -174,6 +174,14 @@ named for the identity, with the profile as a literal value:
 
 Plain `claude` and `claude --resume` are all you need — no extra flags.
 
+**Claude Code does not re-arm a killed monitor.** A hard reboot, an OOM kill or
+a crashed `claude` leaves the MCP server running and the monitor gone, and the
+harness tends to *ask the user* before starting one again — a prompt that
+deadlocks, because the person who would answer it usually reaches this agent
+through the very channel that is down. So the monitor's `description` and the
+skill both tell the agent to check `watcher.state` and re-arm on its own
+authority, then say it did. Give the agent the skill, not just the monitor.
+
 **Why the MCP server is not bundled globally.** This server carries a
 Mattermost identity. Declared globally it would be launched by every unrelated
 session on the machine, as the wrong account for all of them; and a single
@@ -538,6 +546,16 @@ each other's events.
   `heartbeat_age_ms` and the last error it rode out. A `health: live` row whose
   `watcher.state` is not `listening` is an agent that is deaf, which is exactly
   what a fresh identity call alone cannot tell you.
+- **A dead listener is the agent's own problem to fix.** Neither harness brings
+  a killed monitor back by itself — Claude Code in particular asks the user
+  first, a prompt that deadlocks when the channel it is asking about is the
+  only way to reach that agent. So the skill tells the agent to re-arm on its
+  own authority whenever `watcher.state` is `stale` or `absent` and nobody
+  stopped it deliberately, and to report that it did. `retrying` is left
+  alone, exit `3` is somebody else's live listener and must not be doubled, and
+  a deliberate stop stays stopped but gets said out loud rather than leaving
+  the agent quietly unreachable. This is the failure that made four agents look
+  healthy and hear nothing for hours after a reboot.
 - **Event identity is post id + content revision** (`edit_at`, else
   `create_at`): an edit is a new event, while a reaction or a threaded reply is
   not.

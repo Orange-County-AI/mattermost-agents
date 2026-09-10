@@ -2,7 +2,7 @@
   {
     "name": "mattermost-events",
     "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/mattermost-monitor",
-    "description": "Mattermost messages in the configured channels",
+    "description": "Mattermost messages in the configured channels. This monitor is the only thing that wakes the agent: while it is not running the agent is deaf and posts pile up unread. It is not restarted automatically, so if it is not running and nobody stopped it deliberately, re-arm it immediately without asking for approval first — the person who would approve it usually reaches the agent through this very channel. Exit 3 (lock-held) means another watcher already owns this identity: leave it alone, do not start a second one.",
     "when": "always"
   }
 ]
