@@ -1137,11 +1137,12 @@ function adapterUnderTest(): {
 
 async function footerIsOneHonestLine(): Promise<void> {
 	console.log("footer: one line for both integrations, named identities, dead listener marked");
-	const { dir, config, stateDir, origin } = footerWorkspace("line", ["ocai", "ticket500"]);
+	const { dir, config, stateDir, origin } = footerWorkspace("line", ["ocai", "ticket500", "norm"]);
 	recordListener(stateDir, origin, { connection: "ocai", reported: "listening" });
 	// A heartbeat this old is what a dead listener looks like, whatever the
 	// credential says. This is the case that went unnoticed for eight hours.
 	recordListener(stateDir, origin, { connection: "ticket500", reported: "listening", ageMs: 60_000 });
+	// `norm` gets no row at all: nothing has ever listened for it.
 	recordPending(stateDir, origin, "ocai", 2);
 
 	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
@@ -1163,7 +1164,7 @@ async function footerIsOneHonestLine(): Promise<void> {
 	check("that key is the shared one", host.keys()[0] === CHANNEL_STATUS_KEY, String(host.keys()[0]));
 	check(
 		"both segments on that line, chat before mail",
-		host.line() === "mm ocai·ticket500!stale │ mail stub@example.test",
+		host.line() === "mm ocai·ticket500!stale·norm!absent │ mail stub@example.test",
 		String(host.line()),
 	);
 	check(
@@ -1173,7 +1174,11 @@ async function footerIsOneHonestLine(): Promise<void> {
 	);
 
 	mail.set(undefined);
-	check("with only one integration the line is that segment alone", host.line() === "mm ocai·ticket500!stale", String(host.line()));
+	check(
+		"with only one integration the line is that segment alone",
+		host.line() === "mm ocai·ticket500!stale·norm!absent",
+		String(host.line()),
+	);
 
 	await handlers.get("session_shutdown")?.({}, host.context());
 	check("a stopped listener claims no footer space", host.line() === undefined, String(host.line()));
