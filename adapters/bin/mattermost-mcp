@@ -1,0 +1,16 @@
+#!/bin/sh
+# `core mcp` over stdio: the ordinary MCP server both harnesses point at.
+#
+# The tools (mattermost_pending, mattermost_read_post, mattermost_read_channel,
+# mattermost_reply, mattermost_mark_handled) are implemented once, by core. No
+# adapter reimplements them.
+#
+# Credentials never appear here: the config names an env var or a secret, and
+# core resolves it.
+set -eu
+
+_self=$(readlink -f "$0")
+. "$(dirname "$_self")/mattermost-agent-env.sh"
+mattermost_resolve "$_self"
+
+mattermost_exec mcp

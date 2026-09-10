@@ -1,0 +1,10 @@
+#!/bin/sh
+# Plugin entry for the background monitor.
+#
+# Resolves its own real path first, so the plugin works when it is symlinked
+# into ~/.claude/skills or copied into the plugin cache, then hands off to the
+# repo-level wrapper. Everything after this line is core: one JSON event per
+# stdout line, diagnostics on stderr.
+set -eu
+
+exec "$(dirname "$(readlink -f "$0")")/../../bin/mattermost-watch"

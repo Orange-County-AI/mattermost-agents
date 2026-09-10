@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mattermost-agents",
+  "displayName": "Mattermost Agents",
+  "version": "0.1.0",
+  "description": "Delivers Mattermost messages into Claude Code through a background monitor. The reply/ack tools come from an MCP server configured per project, never bundled.",
+  "author": { "name": "Orange County AI" },
+  "keywords": ["mattermost", "chat", "monitor", "mcp"]
+}

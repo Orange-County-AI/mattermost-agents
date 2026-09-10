@@ -1,0 +1,14 @@
+#!/bin/sh
+# `core watch` for harnesses that consume one JSON event per stdout line
+# (Claude Code monitors, manual smoke tests).
+#
+# A wrapper, not a second listener: core owns polling, reconnect, persistence,
+# redelivery and acking, and its stdout passes through untouched.
+set -eu
+
+_self=$(readlink -f "$0")
+. "$(dirname "$_self")/mattermost-agent-env.sh"
+mattermost_resolve "$_self"
+
+printf 'mattermost-adapter: watching with config %s\n' "$CONFIG" >&2
+mattermost_exec watch

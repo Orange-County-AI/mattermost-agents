@@ -1,0 +1,8 @@
+[
+  {
+    "name": "mattermost-events",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/mattermost-monitor",
+    "description": "Mattermost messages in the configured channels",
+    "when": "always"
+  }
+]
