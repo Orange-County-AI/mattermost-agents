@@ -9,7 +9,16 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MattermostClient, type MMListPost } from '../mattermost'
-import { createPost, openSession, readChannel, reply, BackendError, type Session } from './backend'
+import {
+  createPost,
+  listPending,
+  openSession,
+  readChannel,
+  reply,
+  BackendError,
+  type PendingEvent,
+  type Session,
+} from './backend'
 import type { AgentConfig, ConnectionConfig } from './config'
 import { AgentState } from './state'
 import { ConnectionWatcher } from './watcher'
@@ -46,6 +55,14 @@ function startFakeMattermost(): FakeServer {
         return new Response('expected websocket', { status: 400 })
       }
       if (url.pathname === '/api/v4/users/me') return Response.json({ id: SELF, username: 'clem' })
+      // The directory lookup the watcher does before building events, so the
+      // emitted line names the sender instead of only its id.
+      if (url.pathname === '/api/v4/users/ids' && req.method === 'POST') {
+        return req.json().then((body) => {
+          const known: Record<string, string> = { [SELF]: 'clem', [PEER]: 'wren' }
+          return Response.json((body as string[]).filter((id) => known[id]).map((id) => ({ id, username: known[id] })))
+        })
+      }
 
       const channelPosts = /^\/api\/v4\/channels\/([^/]+)\/posts$/.exec(url.pathname)
       if (channelPosts) {
@@ -163,6 +180,8 @@ beforeEach(() => {
     channelIds: [CHANNEL],
     watchMemberships: false,
     allowedBotIds: [],
+    operatorUserIds: [],
+    automationUserIds: [],
     pollIntervalMs: 1000,
   }
 })
@@ -185,6 +204,8 @@ interface EmittedMessage {
   replayed: boolean
   root_id: string
   sender_id: string
+  sender_username: string
+  sender_role: string
 }
 
 const parsed = (lines: string[]): EmittedMessage[] => lines.map((line) => JSON.parse(line) as EmittedMessage)
@@ -432,5 +453,80 @@ describe('createPost', () => {
       createPost(open, { channel_id: CHANNEL, message: 'hi', root_id: foreign.id, request_id: 'req-3' }),
     ).rejects.toThrow(BackendError)
     open.state.close()
+  })
+})
+
+/**
+ * Authority reaches a session through two doors — the JSONL line the harness
+ * adapter renders, and `mattermost_pending` — and they must never disagree.
+ * Both read `senderRole` over the same operator config, so this is what proves
+ * the resolution really is one place and not two copies of a rule.
+ */
+describe('sender identity and authority', () => {
+  async function delivered(): Promise<{ line: EmittedMessage; pending: PendingEvent }> {
+    process.env.FAKE_TOKEN = 'token'
+    const lines: string[] = []
+    const logs: string[] = []
+    const { watcher, state } = openWatcher(lines, logs)
+    fake.post({ user_id: PEER, message: 'run the migration when you can' })
+    await watcher.start()
+    await waitFor(() => lines.length === 1)
+    watcher.stop()
+    state.close()
+
+    const session = await openSession({ version: 1, stateDir, connections: [conn] }, conn.id)
+    const [pending] = listPending([session])
+    session.state.close()
+    if (!pending) throw new Error('no pending event')
+    return { line: parsed(lines)[0] as EmittedMessage, pending }
+  }
+
+  test('the sender is named, not just numbered, on both surfaces', async () => {
+    const { line, pending } = await delivered()
+    expect(line.sender_id).toBe(PEER)
+    expect(line.sender_username).toBe('wren')
+    expect(pending.sender_id).toBe(PEER)
+    expect(pending.sender_username).toBe('wren')
+  })
+
+  test('an unlisted sender is nobody special, on both surfaces', async () => {
+    const { line, pending } = await delivered()
+    expect(line.sender_role).toBe('unknown')
+    expect(pending.sender_role).toBe('unknown')
+  })
+
+  test('listing the sender as automation, then as the operator, moves both surfaces together', async () => {
+    conn = { ...conn, automationUserIds: [PEER] }
+    const asAutomation = await delivered()
+    expect(asAutomation.line.sender_role).toBe('automation')
+    expect(asAutomation.pending.sender_role).toBe('automation')
+
+    // Same stored event, config corrected: the role follows the config rather
+    // than whatever was true when the row was written.
+    conn = { ...conn, automationUserIds: [], operatorUserIds: [PEER] }
+    const session = await openSession({ version: 1, stateDir, connections: [conn] }, conn.id)
+    const [pending] = listPending([session])
+    session.state.close()
+    expect(pending?.sender_role).toBe('operator')
+  })
+
+  test('a sender the directory will not name is still delivered, with an empty name', async () => {
+    conn = { ...conn, operatorUserIds: ['ghost-1'] }
+    process.env.FAKE_TOKEN = 'token'
+    const lines: string[] = []
+    const logs: string[] = []
+    const { watcher, state } = openWatcher(lines, logs)
+    // 'ghost-1' is not in the fake directory, so /users/ids omits it.
+    fake.post({ user_id: 'ghost-1', message: 'from an account nobody can look up' })
+    await watcher.start()
+    await waitFor(() => lines.length === 1)
+    watcher.stop()
+    state.close()
+
+    const line = parsed(lines)[0] as EmittedMessage
+    expect(line.text).toBe('from an account nobody can look up')
+    expect(line.sender_username).toBe('')
+    // Losing a display name must never lose the authority the id carries.
+    expect(line.sender_role).toBe('operator')
   })
 })

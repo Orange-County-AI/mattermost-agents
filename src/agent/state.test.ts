@@ -21,6 +21,7 @@ function event(id: string, overrides: Partial<EventInput> = {}): EventInput {
     channel_id: 'chan',
     root_id: '',
     sender_id: 'peer',
+    sender_username: 'peer-name',
     text: 'hi',
     created_at: 1000,
     updated_at: 1000,

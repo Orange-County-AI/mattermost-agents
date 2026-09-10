@@ -54,6 +54,8 @@ is the convention used below — and `chmod 600` it.
       "watchMemberships": true,
       "channelIds": [],
       "allowedBotIds": [],
+      "operatorUserIds": ["<your own Mattermost user id on this server>"],
+      "automationUserIds": [],
       "pollIntervalMs": 5000
     }
   ]
@@ -69,6 +71,8 @@ is the convention used below — and `chmod 600` it.
 | `watchMemberships` | `true`: scope is this account's real memberships — joined channels and DMs — refreshed while running. `false` (default): scope is exactly `channelIds`. |
 | `channelIds` | required and non-empty when `watchMemberships` is `false`; may be empty only in membership mode. |
 | `allowedBotIds` | peer accounts flagged `is_bot` whose posts are delivered. Ordinary (non-bot) accounts always deliver. |
+| `operatorUserIds` | your own account(s), by Mattermost user id. A post from one of these arrives as `sender_role="operator"`: it MAY contain instructions and the agent acts on them with its normal judgement. Per connection, because the same human is a different user id on every server. |
+| `automationUserIds` | automation accounts you trust the same way — schedulers, tick loops, CI. They arrive as `sender_role="automation"`. Separate from `operatorUserIds` so the agent can tell a robot from you, and so revoking one never touches the other. |
 | `pollIntervalMs` | REST sweep interval, 1000–600000. Default 5000. |
 
 Export the token under the name the profile gives, and prove the identity

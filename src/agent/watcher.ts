@@ -10,8 +10,8 @@
  * passed. A dropped socket therefore costs latency, never messages — the poll
  * timer alone is a correct (slower) watcher.
  */
-import type { MattermostClient } from '../mattermost'
-import type { ConnectionConfig } from './config'
+import type { MattermostClient, MMUser } from '../mattermost'
+import { senderRole, type ConnectionConfig, type SenderRole } from './config'
 import { planSweep, type IngestPolicy } from './ingest'
 import { channelScope, type ChannelScope } from './scope'
 import type { AgentState, StoredEvent } from './state'
@@ -62,13 +62,20 @@ export interface MessageLine {
   channel_id: string
   root_id: string
   sender_id: string
+  /** The sender's username. '' when the directory lookup failed — never a guess. */
+  sender_username: string
+  /**
+   * What the operator's config says this sender is. Resolved here, and from the
+   * same function the MCP tools use, so one event never reports two roles.
+   */
+  sender_role: SenderRole
   text: string
   created_at: number
   updated_at: number
   replayed: boolean
 }
 
-export function messageLine(event: StoredEvent, attempts: number): MessageLine {
+export function messageLine(event: StoredEvent, attempts: number, role: SenderRole): MessageLine {
   return {
     type: 'message',
     connection: event.connection,
@@ -77,6 +84,8 @@ export function messageLine(event: StoredEvent, attempts: number): MessageLine {
     channel_id: event.channel_id,
     root_id: event.root_id,
     sender_id: event.sender_id,
+    sender_username: event.sender_username,
+    sender_role: role,
     text: event.text,
     created_at: event.created_at,
     updated_at: event.updated_at,
@@ -101,6 +110,14 @@ export class ConnectionWatcher {
   private stopped = false
   /** The last server-side failure inside the current tick; diagnostics only. */
   private lastFailure: string | undefined
+  /**
+   * user id → username, for this process. The directory is asked once per
+   * sender and the answer travels with the event, so a redelivery years later
+   * still names who wrote it. A rename therefore shows the old name until the
+   * watcher restarts — a cosmetic staleness, and never an authority one:
+   * `senderRole` reads the immutable id, not this.
+   */
+  private readonly usernames: Record<string, string> = {}
 
   constructor(
     private readonly conn: ConnectionConfig,
@@ -110,7 +127,7 @@ export class ConnectionWatcher {
     selfUserId: string,
     private readonly io: WatcherIo,
   ) {
-    this.policy = { connection: conn.id, selfUserId, allowedBotIds: conn.allowedBotIds }
+    this.policy = { connection: conn.id, selfUserId, allowedBotIds: conn.allowedBotIds, usernames: this.usernames }
     this.scope = channelScope(conn, client, selfUserId)
   }
 
@@ -206,6 +223,9 @@ export class ConnectionWatcher {
     const priorCheckpoint = stored ?? Date.now() - INITIAL_LOOKBACK_MS
     const since = stored === undefined ? priorCheckpoint : Math.max(0, stored - 1)
     const list = await this.client.getChannelPostsSince(channelId, since)
+    // Before the events are built, so the name is stored with them and every
+    // later redelivery names the sender without another directory call.
+    await this.learnUsernames(list.order.map((id) => list.posts[id]?.user_id))
     const plan = planSweep(list, since, this.policy, priorCheckpoint)
     if (plan.observed === 0) return
     if (plan.overflow) {
@@ -227,12 +247,37 @@ export class ConnectionWatcher {
     }
   }
 
+  /**
+   * Fill the username cache for ids it does not have yet. A failure here is
+   * NOT a sweep failure: an unnamed sender is still delivered, still carries
+   * its user id, and still resolves to a role — losing a display name must
+   * never cost a message.
+   */
+  private async learnUsernames(ids: (string | undefined)[]): Promise<void> {
+    const wanted = [
+      ...new Set(ids.filter((id): id is string => typeof id === 'string' && id.length > 0 && !(id in this.usernames))),
+    ]
+    if (wanted.length === 0) return
+    // Mattermost caps /users/ids at 100 per call.
+    for (let at = 0; at < wanted.length; at += 100) {
+      const batch = wanted.slice(at, at + 100)
+      let users: MMUser[]
+      try {
+        users = await this.client.usersByIds(batch)
+      } catch (err) {
+        this.io.log(`warn connection=${this.conn.id} username lookup failed for ${batch.length} sender(s): ${errorText(err)}`)
+        return
+      }
+      for (const user of users) this.usernames[user.id] = user.username
+    }
+  }
+
   /** Print every due event. State is committed first, so a crash re-delivers instead of losing. */
   private drain(): void {
     const now = Date.now()
     for (const event of this.state.duePending(now)) {
       const attempts = this.state.markAttempt(event.event_id, now + redeliveryDelay(event.attempts + 1))
-      this.io.emit(JSON.stringify(messageLine(event, attempts)))
+      this.io.emit(JSON.stringify(messageLine(event, attempts, senderRole(this.conn, event.sender_id))))
     }
   }
 

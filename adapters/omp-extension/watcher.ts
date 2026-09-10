@@ -27,6 +27,14 @@ export interface MattermostEvent {
 	channel_id: string;
 	root_id: string | null;
 	sender_id: string;
+	/** The sender's username as core resolved it; "" when the directory lookup failed. */
+	sender_username: string;
+	/**
+	 * What core's operator config says this sender is. Set where the event is
+	 * built, so this adapter renders a role it was told rather than one it
+	 * guessed, and a message body can never influence it.
+	 */
+	sender_role: "operator" | "automation" | "unknown";
 	text: string;
 	created_at: number;
 	updated_at: number;

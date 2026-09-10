@@ -7,7 +7,14 @@
  * account's real memberships (membership mode) is refused, whoever asks.
  */
 import { MattermostClient, httpStatus, type MMListPost } from '../mattermost'
-import { connectionById, resolveToken, type AgentConfig, type ConnectionConfig } from './config'
+import {
+  connectionById,
+  resolveToken,
+  senderRole,
+  type AgentConfig,
+  type ConnectionConfig,
+  type SenderRole,
+} from './config'
 import { channelScope, type ChannelScope } from './scope'
 import { AgentState, type StoredEvent } from './state'
 
@@ -94,6 +101,14 @@ export interface PendingEvent {
   channel_id: string
   root_id: string
   sender_id: string
+  /** The sender's username as recorded at ingest; '' when the directory lookup failed. */
+  sender_username: string
+  /**
+   * Operator config's verdict on this sender, from the same `senderRole` the
+   * watcher's JSONL uses — so an event listed here and the same event delivered
+   * into a session can never disagree about who is allowed to instruct.
+   */
+  sender_role: SenderRole
   text: string
   created_at: number
   updated_at: number
@@ -120,6 +135,8 @@ export function listPending(sessions: Session[], limit = 50): PendingEvent[] {
         channel_id: event.channel_id,
         root_id: event.root_id,
         sender_id: event.sender_id,
+        sender_username: event.sender_username,
+        sender_role: senderRole(session.conn, event.sender_id),
         text: event.text,
         created_at: event.created_at,
         updated_at: event.updated_at,

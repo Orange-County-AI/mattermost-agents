@@ -294,6 +294,8 @@ describe('planProfileWrite', () => {
     channelIds: [],
     watchMemberships: true,
     allowedBotIds: [],
+    operatorUserIds: [],
+    automationUserIds: [],
     pollIntervalMs: 5000,
   }
   /** What an operator's profile looks like after they extend it by hand. */
@@ -310,6 +312,8 @@ describe('planProfileWrite', () => {
         channelIds: ['dddddddddddddddddddddddddd'],
         watchMemberships: false,
         allowedBotIds: [],
+        operatorUserIds: [],
+        automationUserIds: [],
         pollIntervalMs: 5000,
       },
       { ...intended, channelIds: ['eeeeeeeeeeeeeeeeeeeeeeeeee'], watchMemberships: false, pollIntervalMs: 30_000, ...over },

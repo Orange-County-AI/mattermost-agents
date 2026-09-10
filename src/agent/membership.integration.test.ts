@@ -58,6 +58,8 @@ function watcherFor(
     channelIds: [],
     watchMemberships: true,
     allowedBotIds: [],
+    operatorUserIds: [],
+    automationUserIds: [],
     pollIntervalMs: 1000,
     ...conn,
   }

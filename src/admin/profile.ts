@@ -26,6 +26,10 @@ export interface ProfileConnection {
   channelIds: string[]
   watchMemberships: boolean
   allowedBotIds: string[]
+  /** Mattermost user ids whose posts carry the operator's own authority. */
+  operatorUserIds: string[]
+  /** Automation accounts the operator trusts the same way. */
+  automationUserIds: string[]
   pollIntervalMs: number
 }
 
@@ -47,6 +51,8 @@ export function buildProfile(args: {
   expectedUserId: string
   stateDir?: string
   allowedBotIds?: string[]
+  operatorUserIds?: string[]
+  automationUserIds?: string[]
   pollIntervalMs?: number
 }): AgentProfile {
   return {
@@ -64,6 +70,11 @@ export function buildProfile(args: {
         channelIds: [],
         watchMemberships: true,
         allowedBotIds: args.allowedBotIds ?? [],
+        // Written out empty rather than omitted: an operator editing a fresh
+        // profile can see the knob that decides whose messages may instruct
+        // this agent, instead of having to know the field name exists.
+        operatorUserIds: args.operatorUserIds ?? [],
+        automationUserIds: args.automationUserIds ?? [],
         pollIntervalMs: args.pollIntervalMs ?? 5000,
       },
     ],

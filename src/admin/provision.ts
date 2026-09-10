@@ -477,6 +477,8 @@ export async function provisionAgent(
     channelIds: [],
     watchMemberships: true,
     allowedBotIds: [],
+    operatorUserIds: [],
+    automationUserIds: [],
     pollIntervalMs: 5000,
   })
   const existingProfile = await readProfile(def.name)

@@ -28,6 +28,14 @@ export interface IngestPolicy {
   connection: string
   selfUserId: string
   allowedBotIds: string[]
+  /**
+   * Mattermost user id → username, filled by the watcher before it plans a
+   * sweep. A post carries only the opaque id, and an id alone tells a model
+   * nothing about who is talking; the name travels with the event so a replay
+   * never has to ask the directory again. Missing means the lookup failed —
+   * honest emptiness, never a guess.
+   */
+  usernames?: Record<string, string>
 }
 
 export type SkipReason = 'self' | 'bot-not-allowlisted' | 'system' | 'tombstone' | 'edit-revision' | 'empty'
@@ -71,6 +79,7 @@ export function toEvent(post: MMListPost, policy: IngestPolicy): EventInput {
     channel_id: stringField(post, 'channel_id'),
     root_id: post.root_id,
     sender_id: post.user_id,
+    sender_username: policy.usernames?.[post.user_id] ?? '',
     text,
     created_at: post.create_at,
     updated_at: numberField(post, 'update_at') || post.create_at,

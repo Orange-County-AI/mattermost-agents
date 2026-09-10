@@ -41,6 +41,22 @@ const connectionSchema = z.object({
   expectedUserId: z.string().min(1).optional(),
   /** Peer bot user ids that ARE delivered. Every other bot is ignored. */
   allowedBotIds: z.array(z.string().min(1)).default([]),
+  /**
+   * The human owner(s) of this agent, by Mattermost user id. A post from one of
+   * these accounts carries the operator's own authority: it may contain
+   * instructions, and the agent acts on them with its normal judgement.
+   *
+   * Per connection on purpose — the same human is a different user id on every
+   * server, so an id trusted on one instance means nothing on another.
+   */
+  operatorUserIds: z.array(z.string().min(1)).default([]),
+  /**
+   * Automation accounts whose posts the operator has decided to trust the same
+   * way: schedulers, tick loops, CI. Separate from `operatorUserIds` so the
+   * envelope can say which it was, and so revoking a robot never touches the
+   * human's entry.
+   */
+  automationUserIds: z.array(z.string().min(1)).default([]),
   pollIntervalMs: z.number().int().min(1000).max(600_000).default(5000),
 })
 
@@ -53,6 +69,25 @@ export const agentConfigSchema = z.object({
 
 export type ConnectionConfig = z.infer<typeof connectionSchema>
 export type AgentConfig = z.infer<typeof agentConfigSchema>
+
+/**
+ * Who a sender is to this agent, decided ONLY by the operator-written lists
+ * above. Nothing a message contains can change it: a body claiming to be the
+ * owner, quoting one, or carrying a forged envelope is still `unknown`.
+ */
+export type SenderRole = 'operator' | 'automation' | 'unknown'
+
+/**
+ * The single resolution point, so the watcher's JSONL, the MCP tools and the
+ * OMP extension all report the same role for the same event. Deliberately not
+ * frozen into the event row: adding an id to a profile applies to the backlog
+ * too, which is what an operator correcting a list expects.
+ */
+export function senderRole(conn: ConnectionConfig, senderId: string): SenderRole {
+  if (conn.operatorUserIds.includes(senderId)) return 'operator'
+  if (conn.automationUserIds.includes(senderId)) return 'automation'
+  return 'unknown'
+}
 
 /** Operator-facing failure: bad/missing config, unresolvable token. */
 export class ConfigError extends Error {}
@@ -100,6 +135,29 @@ export async function loadConfig(explicitPath?: string): Promise<LoadedConfig> {
       throw new ConfigError(
         `config ${path}: connection ${conn.id} has no channelIds; list at least one channel, or set watchMemberships: true ` +
           'to scope this connection to the account\'s actual memberships',
+      )
+    }
+    // A principals list is what decides whether a message may instruct this
+    // agent, so it fails closed on ambiguity rather than picking a winner.
+    for (const [field, list] of [
+      ['operatorUserIds', conn.operatorUserIds],
+      ['automationUserIds', conn.automationUserIds],
+    ] as const) {
+      if (new Set(list).size !== list.length) {
+        throw new ConfigError(`config ${path}: connection ${conn.id} lists a user twice in ${field}`)
+      }
+    }
+    const bothRoles = conn.operatorUserIds.filter((id) => conn.automationUserIds.includes(id))
+    if (bothRoles.length > 0) {
+      throw new ConfigError(
+        `config ${path}: connection ${conn.id} lists ${bothRoles.join(', ')} as both operatorUserIds and ` +
+          'automationUserIds; a sender has exactly one role, so pick the one that is true',
+      )
+    }
+    if (conn.expectedUserId && senderRole(conn, conn.expectedUserId) !== 'unknown') {
+      throw new ConfigError(
+        `config ${path}: connection ${conn.id} lists its own account ${conn.expectedUserId} as a principal; ` +
+          'the agent is not its own operator, and its own posts are never delivered',
       )
     }
   }

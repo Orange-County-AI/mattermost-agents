@@ -58,6 +58,9 @@ if (mode === "crash-once") {
 
 const total = Number(process.env.FAKE_CORE_EVENTS ?? "2");
 const connection = process.env.FAKE_CORE_CONNECTION ?? "testconn";
+/** Core resolves the sender's name and role; the adapter only renders them. */
+const senderUsername = process.env.FAKE_CORE_SENDER_USERNAME ?? "user1name";
+const senderRole = process.env.FAKE_CORE_SENDER_ROLE ?? "unknown";
 
 function emit(index: number): void {
 	const now = Date.now();
@@ -70,6 +73,8 @@ function emit(index: number): void {
 			channel_id: "channel1",
 			root_id: index % 2 === 0 ? null : "post0",
 			sender_id: "user1",
+			sender_username: senderUsername,
+			sender_role: senderRole,
 			text: `hello ${index}`,
 			created_at: now,
 			updated_at: now,

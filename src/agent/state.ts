@@ -24,6 +24,8 @@ export interface StoredEvent {
   channel_id: string
   root_id: string
   sender_id: string
+  /** The sender's username at ingest time; '' when the directory lookup failed. */
+  sender_username: string
   text: string
   created_at: number
   updated_at: number
@@ -40,6 +42,7 @@ export interface EventInput {
   channel_id: string
   root_id: string
   sender_id: string
+  sender_username: string
   text: string
   created_at: number
   updated_at: number
@@ -104,6 +107,7 @@ CREATE TABLE IF NOT EXISTS events (
   channel_id TEXT NOT NULL,
   root_id TEXT NOT NULL,
   sender_id TEXT NOT NULL,
+  sender_username TEXT NOT NULL DEFAULT '',
   text TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -164,6 +168,27 @@ CREATE TABLE IF NOT EXISTS watcher_health (
 );
 `
 
+/**
+ * Columns added after a fleet was already deployed. `CREATE TABLE IF NOT
+ * EXISTS` does nothing to a table that exists, so this is the only thing that
+ * brings an old `agent.sqlite` up to date. Additive and idempotent: every entry
+ * carries a DEFAULT, so rows written by an older build stay readable and
+ * nothing is rewritten.
+ */
+const ADDED_COLUMNS: Record<string, Record<string, string>> = {
+  events: { sender_username: "TEXT NOT NULL DEFAULT ''" },
+}
+
+function migrate(db: Database): void {
+  for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
+    const present = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all()
+    for (const [name, definition] of Object.entries(columns)) {
+      if (present.some((column) => column.name === name)) continue
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`)
+    }
+  }
+}
+
 /** A dead holder is one whose heartbeat stopped; on this host we also check the pid. */
 export const LOCK_STALE_MS = 30_000
 
@@ -183,6 +208,7 @@ export class AgentState {
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA busy_timeout = 5000')
     db.exec(SCHEMA)
+    migrate(db)
     return new AgentState(db, `${args.connectionId}|${args.origin}|${args.userId}`)
   }
 
@@ -205,9 +231,9 @@ export class AgentState {
   commitSweep(args: { channelId: string; events: EventInput[]; checkpoint: number; gap?: Omit<Gap, 'noticed_at'> }): number {
     const now = Date.now()
     const insertEvent = this.db.query(
-      `INSERT INTO events (scope, event_id, connection, post_id, channel_id, root_id, sender_id, text,
+      `INSERT INTO events (scope, event_id, connection, post_id, channel_id, root_id, sender_id, sender_username, text,
                            created_at, updated_at, first_seen_at, attempts, next_attempt_at, acked_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL)
        ON CONFLICT (scope, event_id) DO NOTHING`,
     )
     const setCheckpoint = this.db.query(
@@ -228,6 +254,7 @@ export class AgentState {
           e.channel_id,
           e.root_id,
           e.sender_id,
+          e.sender_username,
           e.text,
           e.created_at,
           e.updated_at,

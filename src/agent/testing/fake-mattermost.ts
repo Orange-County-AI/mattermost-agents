@@ -185,6 +185,14 @@ export function startFakeMattermost(): FakeMattermost {
         return Response.json(users.filter((user) => user.username.toLowerCase().includes(term)).map(publicUser))
       }
 
+      // How the watcher turns the opaque user ids on posts into usernames.
+      // Any authenticated caller may ask; Mattermost answers with the public
+      // profile of every id it recognises and silently omits the rest.
+      if (path === '/users/ids' && req.method === 'POST') {
+        const wanted = (await req.json()) as string[]
+        return Response.json(users.filter((user) => wanted.includes(user.id)).map(publicUser))
+      }
+
       const byUsername = /^\/users\/username\/(.+)$/.exec(path)
       if (byUsername) {
         const found = users.find((user) => user.username === byUsername[1])
