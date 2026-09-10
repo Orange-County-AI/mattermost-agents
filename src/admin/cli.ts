@@ -19,7 +19,12 @@
  *   bun src/admin/cli.ts revoke <name>           revoke the recorded token
  *
  * Registration is generic: `provision <name> --username U --email E --label L
- * --secret NAME --connection-id ID [--team ID]` registers any identity.
+ * --secret NAME --connection-id ID [--team ID]` registers any identity. An
+ * account this tool did not create is refused by default; `provision <name>
+ * --adopt <user-id>` is the operator saying, explicitly, that the account with
+ * that id IS this agent. A privileged (system_admin) account is still refused
+ * unless that adoption also carries --allow-privileged, which lifts the
+ * refusal and nothing else: no role is granted, removed or patched.
  *
  * No command prints a token, and no command takes one on the command line.
  */
@@ -159,8 +164,27 @@ async function cmdProvision(argv: string[]): Promise<void> {
   const name = argv[0]
   if (!name) {
     throw new ProvisionError(
-      'usage: provision <name> [--operator-config FILE] [--username U] [--email E] [--label L] [--secret NAME] [--connection-id ID] [--position P] [--team ID] [--dry-run] [--rotate] [--recreate] [--replace-profile]',
+      'usage: provision <name> [--operator-config FILE] [--username U] [--email E] [--label L] [--secret NAME] [--connection-id ID] [--position P] [--team ID] [--adopt USER_ID [--allow-privileged]] [--dry-run] [--rotate] [--recreate] [--replace-profile]',
       'a first run must supply --username --email --label --secret --connection-id (or an "agents" entry in the operator config); later runs reuse the provisioning record',
+    )
+  }
+  // `--adopt` without a value is not "adopt nothing": it is an operator who
+  // meant to name an id, and silently provisioning past that is how the
+  // wrong account gets bound.
+  const adoptUserId = option(argv, 'adopt')
+  if (flag(argv, 'adopt') && (!adoptUserId || adoptUserId.startsWith('--'))) {
+    throw new ProvisionError(
+      '--adopt needs the user id of the account to bind',
+      'find it with `probe`, or with the id printed by the refusal that sent you here: --adopt <USER_ID>',
+    )
+  }
+  // The privilege escape hatch is bound to adoption: on its own it would be a
+  // standing licence to make an admin account into an agent identity.
+  const allowPrivileged = flag(argv, 'allow-privileged')
+  if (allowPrivileged && !adoptUserId) {
+    throw new ProvisionError(
+      'refusing --allow-privileged on its own',
+      'it only lifts the system_admin refusal for an account you are adopting: pass --adopt <USER_ID> with it',
     )
   }
   const operator = await operatorFor(argv)
@@ -171,6 +195,8 @@ async function cmdProvision(argv: string[]): Promise<void> {
     rotate: flag(argv, 'rotate'),
     allowRecreate: flag(argv, 'recreate'),
     replaceProfile: flag(argv, 'replace-profile'),
+    ...(adoptUserId ? { adoptUserId } : {}),
+    ...(allowPrivileged ? { allowPrivileged } : {}),
   })
   for (const action of outcome.actions) console.log(`ok    ${action}`)
   for (const warning of outcome.warnings) console.log(`WARN  ${warning}`)
@@ -178,8 +204,8 @@ async function cmdProvision(argv: string[]): Promise<void> {
   console.log('---')
   console.log(`name          ${r.name}`)
   console.log(`user          ${r.username} (${r.userId})`)
-  console.log(`accountType   ${r.accountType} (is_bot=${r.accountType === 'bot'})`)
-  console.log(`roles         ${r.roles}`)
+  console.log(`accountType   ${r.accountType} (is_bot=${r.accountType === 'bot'})${r.adopted ? ' adopted — pre-existing account, not created here' : ''}`)
+  console.log(`roles         ${r.roles}${r.allowPrivileged ? '  PRIVILEGED — accepted by the operator, never granted here' : ''}`)
   console.log(`team          ${r.teamName} (${r.teamId})`)
   console.log(`secret NAME   ${r.secretName}`)
   console.log(`profile       ${r.profilePath}`)
@@ -281,7 +307,7 @@ async function cmdList(): Promise<void> {
     return
   }
   for (const r of records) {
-    console.log(`${r.name}: ${r.username} (${r.userId}) type=${r.accountType} team=${r.teamId} secret=${r.secretName}`)
+    console.log(`${r.name}: ${r.username} (${r.userId}) type=${r.accountType}${r.adopted ? ' adopted' : ''}${r.allowPrivileged ? ` PRIVILEGED roles="${r.adoptedRoles ?? r.roles}"` : ''} team=${r.teamId} secret=${r.secretName}`)
     console.log(`  steps ${JSON.stringify(r.steps)}${r.incomplete ? ` incomplete: ${r.incomplete}` : ''}`)
   }
 }
@@ -598,6 +624,7 @@ try {
           '  provision <name> [--username U] [--email E] [--label L] [--secret NAME]',
           '                   [--connection-id ID] [--position P] [--team ID] [--dry-run]',
           '                   [--rotate] [--recreate] [--replace-profile]',
+          '                   [--adopt USER_ID [--allow-privileged]]',
           '  verify [name...] [--team ID]   prove stored token, profile and membership agree',
           '  agent-probe <name> [--connection ID] [--observer ID,ID]',
           '                         what that identity can see (needs only ITS secret,',
@@ -610,8 +637,12 @@ try {
           '',
           '  There are no built-in identities: a first `provision` supplies',
           '  --username --email --label --secret --connection-id, and later runs',
-          '  reuse the provisioning record. Exit codes: 0 ok, 2 refusal,',
-          '  4 unverified secret write (NOT known-provisioned).',
+          '  reuse the provisioning record. An existing account this tool did not',
+          '  create is refused; --adopt <user-id> binds it deliberately, once,',
+          '  and --adopt … --allow-privileged accepts one that holds system_admin',
+          '  without ever granting, removing or patching a role.',
+          '  Exit codes: 0 ok, 2 refusal, 4 unverified secret write',
+          '  (NOT known-provisioned).',
         ].join('\n'),
       )
   }

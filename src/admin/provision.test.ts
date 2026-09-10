@@ -41,7 +41,7 @@ const record = (over: Partial<ProvisioningRecord> = {}): ProvisioningRecord => (
 })
 
 describe('decideAccountAction', () => {
-  test('never adopts an existing account nobody provisioned', () => {
+  test('never adopts an existing account nobody provisioned, and names the remedy', () => {
     const decision = decideAccountAction({
       existing: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security' },
       record: null,
@@ -49,6 +49,8 @@ describe('decideAccountAction', () => {
     })
     expect(decision.action).toBe('refuse')
     expect(decision.reason).toContain('no provisioning record')
+    // The operator must be able to paste the remedy straight back.
+    expect(decision.reason).toContain('--adopt zzzzzzzzzzzzzzzzzzzzzzzzzz')
   })
 
   test('refuses when the username now points at a different user id', () => {
@@ -76,6 +78,84 @@ describe('decideAccountAction', () => {
 
   test('creates when nothing exists', () => {
     expect(decideAccountAction({ existing: null, record: null, allowRecreate: false }).action).toBe('create')
+  })
+})
+
+describe('decideAccountAction with --adopt', () => {
+  const adopt = (over: Partial<Parameters<typeof decideAccountAction>[0]['adopt'] & object> = {}) => ({
+    userId: 'zzzzzzzzzzzzzzzzzzzzzzzzzz',
+    account: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security', deleted: false },
+    expectedUsername: 'fleet-security',
+    claimedBy: null,
+    ...over,
+  })
+
+  test('binds the pre-existing account the operator named', () => {
+    const decision = decideAccountAction({
+      existing: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security' },
+      record: null,
+      allowRecreate: false,
+      adopt: adopt(),
+    })
+    expect(decision.action).toBe('adopt')
+  })
+
+  test('an id whose username is not the definition\u2019s is a refusal, never a rebind', () => {
+    const decision = decideAccountAction({
+      existing: null,
+      record: null,
+      allowRecreate: false,
+      adopt: adopt({ account: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'someone-else', deleted: false } }),
+    })
+    expect(decision.action).toBe('refuse')
+    expect(decision.reason).toContain('someone-else')
+  })
+
+  test('an id that is another record\u2019s identity is refused', () => {
+    const decision = decideAccountAction({
+      existing: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security' },
+      record: null,
+      allowRecreate: false,
+      adopt: adopt({ claimedBy: 'fleet-triage' }),
+    })
+    expect(decision.action).toBe('refuse')
+    expect(decision.reason).toContain('fleet-triage')
+  })
+
+  test('an absent or deactivated account cannot be adopted', () => {
+    expect(decideAccountAction({ existing: null, record: null, allowRecreate: false, adopt: adopt({ account: null }) }).action).toBe('refuse')
+    expect(
+      decideAccountAction({
+        existing: null,
+        record: null,
+        allowRecreate: false,
+        adopt: adopt({ account: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security', deleted: true } }),
+      }).action,
+    ).toBe('refuse')
+  })
+
+  test('adoption does not rebind a name whose record owns another account', () => {
+    const decision = decideAccountAction({
+      existing: { id: 'zzzzzzzzzzzzzzzzzzzzzzzzzz', username: 'fleet-security' },
+      record: record(),
+      allowRecreate: false,
+      adopt: adopt(),
+    })
+    expect(decision.action).toBe('refuse')
+    expect(decision.reason).toContain('aaaaaaaaaaaaaaaaaaaaaaaaaa')
+  })
+
+  test('re-affirming the account the record already owns is fine', () => {
+    const decision = decideAccountAction({
+      existing: { id: 'aaaaaaaaaaaaaaaaaaaaaaaaaa', username: 'fleet-security' },
+      record: record({ adopted: true }),
+      allowRecreate: false,
+      adopt: adopt({
+        userId: 'aaaaaaaaaaaaaaaaaaaaaaaaaa',
+        account: { id: 'aaaaaaaaaaaaaaaaaaaaaaaaaa', username: 'fleet-security', deleted: false },
+      }),
+    })
+    expect(decision.action).toBe('adopt')
   })
 })
 

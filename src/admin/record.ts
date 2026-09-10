@@ -42,6 +42,22 @@ export interface ProvisioningRecord {
   teamId: string
   teamName: string
   secretName: string
+  /**
+   * True when this identity was bound to a PRE-EXISTING account with
+   * `provision --adopt <user-id>` instead of being created here. The
+   * distinction is worth keeping: the account's history, its email and
+   * whatever else it already had are not this tool's doing.
+   */
+  adopted?: true
+  /**
+   * True when an operator accepted a PRIVILEGED account (one holding
+   * `system_admin`) with `--adopt … --allow-privileged`. It records consent,
+   * not a grant: provisioning never gave this account a role and never took
+   * one away. A later run reads it and does not ask again.
+   */
+  allowPrivileged?: true
+  /** The exact role string that was accepted, as the server reported it. */
+  adoptedRoles?: string
   /** Which profile connection this identity is bound to. */
   connectionId: string
   /** Access token id (an identifier, not the credential) so it can be revoked. */

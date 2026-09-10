@@ -23,6 +23,22 @@ export interface FakeUser {
   username: string
   is_bot: boolean
   token: string
+  /** Space-separated, as Mattermost reports them. */
+  roles: string
+  email: string
+  nickname: string
+  position: string
+  /** Non-zero = deactivated, which is what the API calls "deleted". */
+  delete_at: number
+}
+
+/** A personal access token: an id, an opaque value, and who it authenticates as. */
+export interface FakeAccessToken {
+  id: string
+  user_id: string
+  token: string
+  description: string
+  is_active: boolean
 }
 
 export interface FakeTeam {
@@ -51,7 +67,16 @@ export interface FakeMattermost {
   channels: FakeChannel[]
   posts: MMListPost[]
   /** Fixture setup. */
-  addUser(args: { id: string; username: string; is_bot?: boolean }): FakeUser
+  addUser(args: {
+    id: string
+    username: string
+    is_bot?: boolean
+    roles?: string
+    email?: string
+    nickname?: string
+    position?: string
+    delete_at?: number
+  }): FakeUser
   addTeam(args: { id: string; name: string; display_name?: string; type?: string }): FakeTeam
   addChannel(args: { id: string; team_id: string; name: string; display_name?: string; type?: string }): FakeChannel
   addTeamMember(teamId: string, userId: string): void
@@ -68,6 +93,16 @@ export interface FakeMattermost {
   /** How many creates the server actually performed, ambiguous failures included. */
   createdCount(): number
   /**
+   * Personal access tokens, as minted through the admin surface. A test can
+   * read them to prove exactly one was issued — or that none was.
+   */
+  accessTokens: FakeAccessToken[]
+  /**
+   * Operators allowed to mint a token FOR A BOT (models manage_bots). Empty
+   * means no one can, which is how a real installation refuses.
+   */
+  botTokenMinters: Set<string>
+  /**
    * Every request the server answered, as "METHOD /path". Lets a test prove a
    * channel was never even asked about, instead of sleeping and hoping.
    */
@@ -83,6 +118,8 @@ export function startFakeMattermost(): FakeMattermost {
   const channelMembers = new Set<string>()
   const teamInviters = new Set<string>()
   const requests: string[] = []
+  const accessTokens: FakeAccessToken[] = []
+  const botTokenMinters = new Set<string>()
   const state = { failPostWith: null as number | null, failCreateWith: null as number | null, creates: 0 }
   let clock = Date.now() - 60_000
   let counter = 0
@@ -93,8 +130,16 @@ export function startFakeMattermost(): FakeMattermost {
 
   const caller = (req: Request): FakeUser | undefined => {
     const token = (req.headers.get('authorization') ?? '').replace(/^Bearer /, '')
-    return users.find((user) => user.token === token)
+    const direct = users.find((user) => user.token === token)
+    if (direct) return direct
+    // A minted personal access token authenticates as its owner, exactly like
+    // the fixture token does.
+    const pat = accessTokens.find((t) => t.is_active && t.token === token)
+    return pat ? users.find((user) => user.id === pat.user_id) : undefined
   }
+
+  /** The admin surface is admin-only, as it is on a real server. */
+  const isAdmin = (user: FakeUser): boolean => /(^|\s)system_admin(\s|$)/.test(user.roles)
 
   const create = (args: { channel_id: string; user_id: string; message: string; root_id?: string }): MMListPost => {
     clock += 1000
@@ -144,6 +189,110 @@ export function startFakeMattermost(): FakeMattermost {
       if (byUsername) {
         const found = users.find((user) => user.username === byUsername[1])
         return found ? Response.json(publicUser(found)) : missing('user not found')
+      }
+
+      // --- administrative surface -------------------------------------
+      // Everything below is what an OPERATOR credential does: look accounts
+      // up by email, create them, patch them, grant the token role, mint and
+      // revoke personal access tokens. A non-admin caller gets the 403 the
+      // real server gives, so a test cannot pass by accident.
+      const byEmail = /^\/users\/email\/(.+)$/.exec(path)
+      if (byEmail) {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const email = decodeURIComponent(String(byEmail[1]))
+        const found = users.find((user) => user.email === email)
+        return found ? Response.json(publicUser(found)) : missing('user not found')
+      }
+
+      if (path === '/users' && req.method === 'POST') {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const body = (await req.json()) as {
+          username: string
+          email: string
+          password?: string
+          nickname?: string
+          first_name?: string
+          position?: string
+        }
+        if (users.some((user) => user.username === body.username)) {
+          return new Response(JSON.stringify({ message: 'an account with that username already exists' }), { status: 400 })
+        }
+        const created: FakeUser = {
+          id: `user-${users.length + 1}`,
+          username: body.username,
+          is_bot: false,
+          token: `token-${body.username}`,
+          roles: 'system_user',
+          email: body.email,
+          nickname: body.nickname ?? '',
+          position: body.position ?? '',
+          delete_at: 0,
+        }
+        users.push(created)
+        return Response.json(publicUser(created), { status: 201 })
+      }
+
+      if (path === '/users/tokens/revoke' && req.method === 'POST') {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const body = (await req.json()) as { token_id: string }
+        const token = accessTokens.find((t) => t.id === body.token_id)
+        if (!token) return missing('token not found')
+        token.is_active = false
+        return Response.json({ status: 'OK' })
+      }
+
+      const userTokens = /^\/users\/([^/]+)\/tokens$/.exec(path)
+      if (userTokens) {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const owner = users.find((user) => user.id === userTokens[1])
+        if (!owner) return missing('user not found')
+        if (req.method === 'GET') {
+          return Response.json(
+            accessTokens
+              .filter((t) => t.user_id === owner.id)
+              .map((t) => ({ id: t.id, user_id: t.user_id, description: t.description, is_active: t.is_active })),
+          )
+        }
+        // Minting FOR A BOT is a manage_bots capability of the caller, not a
+        // role on the bot; for anybody else the target needs the token
+        // capability itself (an admin already holds it).
+        if (owner.is_bot) {
+          if (!botTokenMinters.has(me.id)) return forbidden('you do not have permission to manage bot accounts')
+        } else if (!/(^|\s)(system_user_access_token|system_admin)(\s|$)/.test(owner.roles)) {
+          return forbidden('user does not have permission to create personal access tokens')
+        }
+        const body = (await req.json()) as { description?: string }
+        const token: FakeAccessToken = {
+          id: `pat-${accessTokens.length + 1}`,
+          user_id: owner.id,
+          token: `pat-value-${owner.username}-${accessTokens.length + 1}`,
+          description: body.description ?? '',
+          is_active: true,
+        }
+        accessTokens.push(token)
+        return Response.json(token, { status: 201 })
+      }
+
+      const userPatch = /^\/users\/([^/]+)\/patch$/.exec(path)
+      if (userPatch && req.method === 'PUT') {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const target = users.find((user) => user.id === userPatch[1])
+        if (!target) return missing('user not found')
+        const body = (await req.json()) as { nickname?: string; position?: string; email?: string }
+        if (body.nickname !== undefined) target.nickname = body.nickname
+        if (body.position !== undefined) target.position = body.position
+        if (body.email !== undefined) target.email = body.email
+        return Response.json(publicUser(target))
+      }
+
+      const userRoles = /^\/users\/([^/]+)\/roles$/.exec(path)
+      if (userRoles && req.method === 'PUT') {
+        if (!isAdmin(me)) return forbidden('you do not have the appropriate permissions')
+        const target = users.find((user) => user.id === userRoles[1])
+        if (!target) return missing('user not found')
+        const body = (await req.json()) as { roles: string }
+        target.roles = body.roles
+        return Response.json({ status: 'OK' })
       }
 
       if (path === '/users/me/teams') {
@@ -197,6 +346,17 @@ export function startFakeMattermost(): FakeMattermost {
         }
         teamMembers.add(key(team.id, body.user_id))
         return Response.json({ team_id: team.id, user_id: body.user_id, roles: 'team_user' }, { status: 201 })
+      }
+
+      const teamMemberOne = /^\/teams\/([^/]+)\/members\/([^/]+)$/.exec(path)
+      if (teamMemberOne && req.method === 'GET') {
+        const [, teamId, rawUserId] = teamMemberOne
+        const userId = rawUserId === 'me' ? me.id : String(rawUserId)
+        if (!teams.some((team) => team.id === teamId)) return missing('team not found')
+        // Absence of a membership is 404, which is how provisioning tells
+        // "not in the team yet" from "cannot ask".
+        if (!teamMembers.has(key(String(teamId), userId))) return missing('team member not found')
+        return Response.json({ team_id: teamId, user_id: userId, roles: 'team_user' })
       }
 
       const teamById = /^\/teams\/([^/]+)$/.exec(path)
@@ -385,12 +545,19 @@ export function startFakeMattermost(): FakeMattermost {
     posts,
     teamInviters,
     requests,
+    accessTokens,
+    botTokenMinters,
     addUser(args) {
       const user: FakeUser = {
         id: args.id,
         username: args.username,
         is_bot: args.is_bot ?? false,
         token: `token-${args.username}`,
+        roles: args.roles ?? 'system_user',
+        email: args.email ?? `${args.username}@fake.invalid`,
+        nickname: args.nickname ?? '',
+        position: args.position ?? '',
+        delete_at: args.delete_at ?? 0,
       }
       users.push(user)
       return user
@@ -439,5 +606,15 @@ export function startFakeMattermost(): FakeMattermost {
 }
 
 function publicUser(user: FakeUser): Record<string, unknown> {
-  return { id: user.id, username: user.username, is_bot: user.is_bot, roles: 'system_user', nickname: '' }
+  return {
+    id: user.id,
+    username: user.username,
+    is_bot: user.is_bot,
+    roles: user.roles,
+    email: user.email,
+    nickname: user.nickname,
+    first_name: user.nickname,
+    position: user.position,
+    delete_at: user.delete_at,
+  }
 }

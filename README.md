@@ -376,12 +376,13 @@ rotate-operator [--expect-token-id ID]
 A first `provision` run requires `--username`, `--email`, `--label`,
 `--secret NAME` and `--connection-id ID` — or an entry of that name in the
 config's `agents` block. `--team ID` is required only when the config has no
-`teamId`. `--position`, `--dry-run`, `--rotate`, `--recreate` and
-`--replace-profile` are optional. `<name>` is the only positional and becomes
-the profile filename, the record filename and the state-dir leaf; a later run
-needs only `<name>`, because definitions resolve flags → config `agents` entry →
-provisioning record, in that order. `verify` with no names verifies every
-record, and exits `2` with "nothing to verify" when there are none.
+`teamId`. `--position`, `--dry-run`, `--rotate`, `--recreate`,
+`--replace-profile` and `--adopt USER_ID` are optional. `<name>` is the only
+positional and becomes the profile filename, the record filename and the
+state-dir leaf; a later run needs only `<name>`, because definitions resolve
+flags → config `agents` entry → provisioning record, in that order. `verify`
+with no names verifies every record, and exits `2` with "nothing to verify"
+when there are none.
 
 ```sh
 bun src/admin/cli.ts whoami
@@ -418,7 +419,8 @@ profile names the secret, and token values move in-process and over stdin to
 
 Re-running is safe by design: an existing account is reused only when the
 record proves this tool created that exact user id (an unrelated account with
-the same username is refused, never adopted); an existing secret is checked
+the same username is refused, never adopted — see below for the one explicit
+way to bind such an account);
 against the server and reused when it already authenticates as the right user,
 refused when it authenticates as somebody else, and replaced only with
 `--rotate`; an existing profile whose binding already matches is not opened at
@@ -432,6 +434,62 @@ by a re-run.
 Accounts created this way are ordinary users (`is_bot=false`) unless your server
 lets your operator create real bot accounts — a bot session may not create
 bots, so an operator credential that is itself a bot cannot.
+
+### Adopting an account this tool did not create
+
+An installation that already has the agents' accounts — created by a human,
+or by whatever came before this tool — hits the ownership refusal on the
+first run: the username exists, no provisioning record claims it, and
+adopting it silently is exactly the mistake the record exists to prevent. The
+refusal prints the user id it found, and `--adopt` is how an operator says,
+once and explicitly, that the account with that id *is* this agent:
+
+```sh
+# Refused, and it hands back the id: "…re-run with --adopt <USER_ID>"
+bun src/admin/cli.ts provision clem --username clem \
+  --email clem@agents.example.com --label "Clem (AI agent)" \
+  --secret MATTERMOST_AGENT_CLEM_TOKEN --connection-id example
+
+bun src/admin/cli.ts provision clem --username clem \
+  --email clem@agents.example.com --label "Clem (AI agent)" \
+  --secret MATTERMOST_AGENT_CLEM_TOKEN --connection-id example \
+  --adopt <USER_ID>
+```
+
+Adoption binds; it never creates. The id must resolve to a live account whose
+username is exactly the one the definition resolves to — a mismatch is a
+refusal, never a quiet rebind — and an id already recorded under a different
+name is refused, because one account is one agent. The account's email is
+left alone. Everything downstream is the ordinary run: a token is minted into
+the named secret (or the stored one reused when it already authenticates as
+that user), the team membership is made, the profile is written, and the
+record is written with `adopted: true` — so `list` marks it `adopted`,
+`verify` treats it as this tool's identity, and every later run needs only
+`provision <name>`, with no `--adopt` and no flags.
+
+An account holding `system_admin` is refused even then, because an agent
+identity that can administer the server is a different kind of thing. Some
+fleets have exactly that anyway — a bot that already runs the installation
+and cannot be demoted to be migrated — so the refusal has one narrow escape
+hatch, accepted only alongside `--adopt`:
+
+```sh
+bun src/admin/cli.ts provision adminbot --username adminbot \
+  --email adminbot@agents.example.com --label "Admin Bot (AI agent)" \
+  --secret MATTERMOST_AGENT_ADMINBOT_TOKEN --connection-id example \
+  --adopt <USER_ID> --allow-privileged
+```
+
+`--allow-privileged` lifts a refusal and does nothing else: no role is
+granted, none is removed, none is patched. The run prints a one-line
+`WARN  PRIVILEGED IDENTITY: …` naming the exact roles retained, and the
+record keeps `allowPrivileged: true` with `adoptedRoles` set to the role
+string that was accepted — so `list` shows `PRIVILEGED roles="…"`, `verify`
+reports the privilege (and warns if the roles have since changed) instead of
+failing the identity, and later runs need no flags. The flag on its own,
+without `--adopt`, is refused. Bot accounts are adopted the same way and get
+their own token; a server that will not mint one for a bot fails the run
+loudly rather than leaving an identity with no credential.
 
 ## Reliability, honestly
 

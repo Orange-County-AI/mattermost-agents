@@ -31,6 +31,7 @@ import { digest, readSecret, readSecretFromStore, writeSecret, type StoreRead } 
 import type { OperatorConfig } from './operator-config'
 import {
   assertCredentialFree,
+  listRecords,
   readRecord,
   recordPath,
   writeRecord,
@@ -164,7 +165,7 @@ export function requireTeamId(config: OperatorConfig, override?: string): string
   return teamId
 }
 
-export type AccountAction = 'create' | 'reuse' | 'refuse'
+export type AccountAction = 'create' | 'reuse' | 'adopt' | 'refuse'
 
 export interface AccountDecision {
   action: AccountAction
@@ -172,16 +173,75 @@ export interface AccountDecision {
 }
 
 /**
+ * What `--adopt <user-id>` was answered with. Adoption is the ONE way to bind
+ * an account this tool did not create, and it is never inferred: the operator
+ * names the id, and every fact needed to refuse is gathered before the
+ * decision is made.
+ */
+export interface AdoptionRequest {
+  /** The id the operator typed. */
+  userId: string
+  /** What the server returned for that id; null when there is no such user. */
+  account: { id: string; username: string; deleted: boolean } | null
+  /** The username the resolved definition demands — adoption never renames. */
+  expectedUsername: string
+  /** Another provisioning record that already owns this id, if there is one. */
+  claimedBy: string | null
+}
+
+/**
  * Ownership check, kept pure so the refusal paths are testable without a
  * server. "The name is taken" and "we own the name" are different facts and
  * only the second one may mint a credential.
+ *
+ * `adopt` is the operator asserting the third fact — "that account IS this
+ * agent" — which nothing on the server can establish. It still has to survive
+ * every check that makes the assertion falsifiable: the account must exist,
+ * be alive, carry exactly the definition's username, and belong to no other
+ * record.
  */
 export function decideAccountAction(args: {
   existing: { id: string; username: string } | null
   record: ProvisioningRecord | null
   allowRecreate: boolean
+  adopt?: AdoptionRequest | null
 }): AccountDecision {
-  const { existing, record, allowRecreate } = args
+  const { existing, record, allowRecreate, adopt } = args
+  if (adopt) {
+    if (!adopt.account) {
+      return { action: 'refuse', reason: `--adopt ${adopt.userId}: this server has no user with that id` }
+    }
+    if (adopt.account.deleted) {
+      return {
+        action: 'refuse',
+        reason: `--adopt ${adopt.userId}: account ${adopt.account.username} is deactivated — reactivate it first, or provision a new one`,
+      }
+    }
+    if (adopt.account.username !== adopt.expectedUsername) {
+      return {
+        action: 'refuse',
+        reason: `--adopt ${adopt.userId} is @${adopt.account.username}, but this definition's username is @${adopt.expectedUsername} — refusing to bind a different account than the one named`,
+      }
+    }
+    if (adopt.claimedBy) {
+      return {
+        action: 'refuse',
+        reason: `--adopt ${adopt.userId} is already the provisioning record of "${adopt.claimedBy}" — one account is one agent; refusing to bind it to a second name`,
+      }
+    }
+    if (record && record.userId !== adopt.account.id) {
+      return {
+        action: 'refuse',
+        reason: `the provisioning record already owns ${record.userId}; refusing to rebind it to ${adopt.account.id} — revoke and remove that record first if the old identity is really gone`,
+      }
+    }
+    return {
+      action: 'adopt',
+      reason: record
+        ? `re-affirming the adopted account ${adopt.account.username} (${adopt.account.id})`
+        : `operator adopted the pre-existing account ${adopt.account.username} (${adopt.account.id})`,
+    }
+  }
   if (existing && record && record.userId === existing.id) {
     return { action: 'reuse', reason: `record owns user ${existing.id}` }
   }
@@ -194,7 +254,7 @@ export function decideAccountAction(args: {
   if (existing) {
     return {
       action: 'refuse',
-      reason: `username ${existing.username} already exists (${existing.id}) and no provisioning record claims it — refusing to adopt an unrelated account`,
+      reason: `username ${existing.username} already exists (${existing.id}) and no provisioning record claims it — refusing to adopt an unrelated account. If that account IS this agent, say so explicitly: re-run with --adopt ${existing.id}`,
     }
   }
   if (record && !allowRecreate) {
@@ -294,6 +354,18 @@ export interface ProvisionOptions {
   dryRun?: boolean
   /** Overwrite an existing profile wholesale. Off by default, on purpose. */
   replaceProfile?: boolean
+  /**
+   * Bind a PRE-EXISTING account, named by user id. The only supported way to
+   * take over an account this tool did not create; never inferred from a
+   * matching username.
+   */
+  adoptUserId?: string
+  /**
+   * Accept an account that holds `system_admin`. Meaningful ONLY together
+   * with `adoptUserId`: it lifts a refusal, it never grants privilege, and
+   * it never edits the account's roles.
+   */
+  allowPrivileged?: boolean
 }
 
 export interface ProvisionOutcome {
@@ -328,6 +400,14 @@ export async function provisionAgent(
   const teamId = requireTeamId(operator.config, options.teamId)
   const actions: string[] = []
   const warnings: string[] = []
+  // Privilege is only ever accepted as part of a deliberate adoption. On its
+  // own the flag would be a standing licence to provision an admin identity.
+  if (options.allowPrivileged && !options.adoptUserId) {
+    throw new ProvisionError(
+      'refusing --allow-privileged on its own',
+      'it only lifts the system_admin refusal for an account you are adopting: pass --adopt <user-id> with it',
+    )
+  }
 
   // Pre-flight the secret store BEFORE any mutation. If the store cannot say
   // authoritatively whether this name holds something, no account is created
@@ -350,10 +430,38 @@ export async function provisionAgent(
   }
   const existing = byUsername.ok ? byUsername.data : null
 
+  // --- adoption ------------------------------------------------------------
+  // The operator asserts that a pre-existing account IS this agent. Nothing
+  // here is inferred from a matching username: the id is resolved on the
+  // server and checked against every other record BEFORE any decision.
+  let adoption: AdoptionRequest | null = null
+  let adoptedUser: MMUser | null = null
+  if (options.adoptUserId) {
+    const id = options.adoptUserId
+    const byId = await client.userById(id)
+    if (!byId.ok && byId.status !== 404) {
+      throw new ProvisionError(
+        `cannot look up user ${id}`,
+        `GET /users/${id} answered HTTP ${byId.status} ${byId.body}`,
+      )
+    }
+    adoptedUser = byId.ok ? byId.data : null
+    const claimedBy = (await listRecords()).find((r) => r.userId === id && r.name !== def.name)?.name ?? null
+    adoption = {
+      userId: id,
+      account: adoptedUser
+        ? { id: adoptedUser.id, username: adoptedUser.username, deleted: Number(adoptedUser.delete_at ?? 0) > 0 }
+        : null,
+      expectedUsername: def.username,
+      claimedBy,
+    }
+  }
+
   const decision = decideAccountAction({
     existing: existing ? { id: existing.id, username: existing.username } : null,
     record: existingRecord,
     allowRecreate: options.allowRecreate ?? false,
+    adopt: adoption,
   })
   if (decision.action === 'refuse') throw new ProvisionError(`refusing to provision ${def.name}`, decision.reason)
 
@@ -374,7 +482,7 @@ export async function provisionAgent(
   const existingProfile = await readProfile(def.name)
   const preflight = planProfileWrite(
     existingProfile,
-    intendedFor(existing?.id ?? '(created by this run)'),
+    intendedFor(existing?.id ?? adoptedUser?.id ?? '(created by this run)'),
     { replace: options.replaceProfile },
   )
   if (preflight.action === 'refuse') {
@@ -390,7 +498,7 @@ export async function provisionAgent(
         name: def.name,
         serverUrl,
         connectionId: def.connectionId,
-        userId: existing?.id ?? '(unknown until created)',
+        userId: existing?.id ?? adoptedUser?.id ?? '(unknown until created)',
         username: def.username,
         email: def.email,
         displayLabel: def.displayLabel,
@@ -406,6 +514,7 @@ export async function provisionAgent(
         createdAt: existingRecord?.createdAt ?? new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         steps: existingRecord?.steps ?? emptySteps(),
+        ...(decision.action === 'adopt' || existingRecord?.adopted ? { adopted: true as const } : {}),
         incomplete: 'dry run — nothing was changed',
       },
       actions,
@@ -415,9 +524,13 @@ export async function provisionAgent(
 
   // --- account -------------------------------------------------------------
   let user: MMUser
-  if (decision.action === 'reuse') {
-    user = existing as MMUser
-    actions.push(`reused existing account ${user.username} (${user.id})`)
+  if (decision.action === 'reuse' || decision.action === 'adopt') {
+    user = (decision.action === 'adopt' ? adoptedUser : existing) as MMUser
+    actions.push(
+      decision.action === 'adopt'
+        ? `adopted pre-existing account ${user.username} (${user.id}) — not created by this tool`
+        : `reused existing account ${user.username} (${user.id})`,
+    )
   } else {
     const emailOwner = await client.userByEmail(def.email)
     if (emailOwner.ok && emailOwner.data) {
@@ -444,10 +557,24 @@ export async function provisionAgent(
     actions.push(`created account ${user.username} (${user.id})`)
   }
 
-  if (/(^|\s)system_admin(\s|$)/.test(user.roles)) {
+  // --- privilege -----------------------------------------------------------
+  // An agent identity that can administer the server is a real hazard, so the
+  // refusal stands by default. It is lifted ONLY where an operator adopted a
+  // pre-existing privileged account on purpose (or already did, and the
+  // record says so) — and even then nothing here touches the roles: they are
+  // reported, recorded, and left exactly as the server has them.
+  const privileged = /(^|\s)system_admin(\s|$)/.test(user.roles)
+  const privilegeAuthorized =
+    (decision.action === 'adopt' && options.allowPrivileged === true) || existingRecord?.allowPrivileged === true
+  if (privileged && !privilegeAuthorized) {
     throw new ProvisionError(
       `refusing to use ${user.username}`,
-      `account holds system_admin (${user.roles}); agent identities must be ordinary users`,
+      `account holds system_admin (${user.roles}); agent identities must be ordinary users.\n  If this privileged account IS the agent and must keep its roles, say so: --adopt ${user.id} --allow-privileged`,
+    )
+  }
+  if (privileged) {
+    warnings.push(
+      `PRIVILEGED IDENTITY: ${user.username} (${user.id}) keeps roles "${user.roles}" — this agent's credential administers the server; roles were neither granted, removed nor patched.`,
     )
   }
 
@@ -458,7 +585,9 @@ export async function provisionAgent(
     connectionId: def.connectionId,
     userId: user.id,
     username: user.username,
-    email: def.email,
+    // An adopted account's email is the account's own: this tool never set it
+    // and never changes it, so the record reports what the server has.
+    email: (decision.action === 'adopt' ? (user.email ?? def.email) : def.email) || def.email,
     displayLabel: def.displayLabel,
     accountType: user.is_bot ? 'bot' : 'user',
     roles: user.roles,
@@ -472,13 +601,22 @@ export async function provisionAgent(
     createdAt: existingRecord?.createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     steps: { ...emptySteps(), accountCreated: true },
+    ...(decision.action === 'adopt' || existingRecord?.adopted ? { adopted: true as const } : {}),
+    ...(privilegeAuthorized && privileged
+      ? { allowPrivileged: true as const, adoptedRoles: user.roles }
+      : {}),
     incomplete: 'provisioning in progress',
   }
   assertCredentialFree(record)
   await writeRecord(record)
 
   // --- display label -------------------------------------------------------
-  if (decision.action === 'reuse' && (user.nickname !== def.displayLabel || user.position !== def.position)) {
+  // Adoption is treated exactly like reuse here: the operator supplied a
+  // label in the definition, so it is the label this identity wears.
+  if (
+    (decision.action === 'reuse' || decision.action === 'adopt') &&
+    (user.nickname !== def.displayLabel || user.position !== def.position)
+  ) {
     const patched = await client.patchUser(user.id, {
       nickname: def.displayLabel,
       first_name: def.displayLabel,
@@ -538,8 +676,15 @@ export async function provisionAgent(
   } else {
     // Personal access tokens need the system_user_access_token role. That is a
     // token-issuing capability, NOT an admin grant.
+    //
+    // A privileged account accepted with --allow-privileged is the exception:
+    // its role string is not this tool's to edit, in either direction. The
+    // mint is attempted as-is, and a server that will not issue one says so
+    // loudly below instead of being quietly worked around.
     const roles = user.roles.split(/\s+/).filter(Boolean)
-    if (!roles.includes('system_user_access_token')) {
+    if (privileged) {
+      actions.push(`left roles untouched on privileged account (${user.roles})`)
+    } else if (!roles.includes('system_user_access_token')) {
       const next = [...roles, 'system_user_access_token'].join(' ')
       const granted = await client.setUserRoles(user.id, next)
       if (!granted.ok) {
@@ -553,7 +698,7 @@ export async function provisionAgent(
       record.roles = next
       actions.push(`granted role system_user_access_token (roles now: ${next})`)
     }
-    record.steps.tokenRoleGranted = true
+    record.steps.tokenRoleGranted = /(^|\s)system_user_access_token(\s|$)/.test(record.roles)
     await writeRecord(record)
 
     const minted = await client.createUserAccessToken(user.id, `mattermost-agents ${def.name} (${def.secretName})`)
@@ -562,7 +707,13 @@ export async function provisionAgent(
       await writeRecord(record)
       throw new ProvisionError(
         `cannot mint an access token for ${user.username}`,
-        `POST /users/{id}/tokens answered HTTP ${minted.status} ${minted.body}`,
+        `POST /users/{id}/tokens answered HTTP ${minted.status} ${minted.body}` +
+          (privileged
+            ? `\n  Roles were left untouched by design: this account holds "${user.roles}" and --allow-privileged never edits them. If the server needs system_user_access_token on it, grant that out of band and re-run.`
+            : '') +
+          (user.is_bot
+            ? `\n  This is a BOT account: minting for a bot needs an operator with manage_bots (and EnableUserAccessTokens for non-bots). Nothing was stored.`
+            : ''),
       )
     }
     const tokenValue = minted.data.token
@@ -697,8 +848,19 @@ export async function verifyAgent(
   if (self.ok && self.data) {
     findings.push(`server reports is_bot=${Boolean(self.data.is_bot)} roles="${self.data.roles}" auth_service="${self.data.auth_service ?? ''}"`)
     if (/(^|\s)system_admin(\s|$)/.test(self.data.roles)) {
-      ok = false
-      findings.push('ACCOUNT HOLDS system_admin — this must never be an agent identity')
+      if (record.allowPrivileged) {
+        // Consent was given once, deliberately, and is on file. Verify keeps
+        // saying it out loud without calling the identity broken.
+        findings.push(
+          `PRIVILEGED: account holds system_admin, accepted by the operator as "${record.adoptedRoles ?? self.data.roles}"`,
+        )
+        if (record.adoptedRoles && record.adoptedRoles !== self.data.roles) {
+          findings.push(`WARNING: roles are now "${self.data.roles}", not the accepted "${record.adoptedRoles}"`)
+        }
+      } else {
+        ok = false
+        findings.push('ACCOUNT HOLDS system_admin — this must never be an agent identity')
+      }
     }
   }
   const teams = await asAgent.raw<{ id: string; name: string }[]>('GET', '/users/me/teams')
