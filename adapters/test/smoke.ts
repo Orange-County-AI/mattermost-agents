@@ -17,8 +17,9 @@
  *   - lifecycle: a terminal exit does not restart-loop, a crash does, and
  *     stopping leaves no orphan.
  *   - the footer: one rendered line for every channel integration in the
- *     process, naming the identities, always marking a listener that is not
- *     listening, and refusing a status config it does not understand.
+ *     process, labelled with each one's brand glyph, naming the identities,
+ *     always marking a listener that is not listening, and refusing a status
+ *     config it does not understand.
  *
  * Deliberately outside `bun test`'s pattern so it never runs as part of the
  * core suite.
@@ -40,9 +41,25 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentState, WatcherHealth } from "../../src/agent/state.ts";
-import { CHANNEL_STATUS_KEY, MAIL_ORDER, registerChannelStatus } from "../omp-extension/channel-status.ts";
+import {
+	CHANNEL_STATUS_KEY,
+	CHAT_ORDER,
+	describeGlyph,
+	LABEL_STYLES,
+	MAIL_ORDER,
+	registerChannelStatus,
+} from "../omp-extension/channel-status.ts";
 import mattermostAdapter, { formatDelivery, type ExtensionApi, type ExtensionCtx } from "../omp-extension/index.ts";
-import { DEFAULT_STATUS, parseStatusConfig, readProfileFacts, StatusConfigError } from "../omp-extension/status.ts";
+import {
+	CHANNEL_LABEL,
+	DEFAULT_STATUS,
+	labelChoice,
+	parseStatusConfig,
+	readProfileFacts,
+	renderSegmentBody,
+	type SegmentEntry,
+	StatusConfigError,
+} from "../omp-extension/status.ts";
 import { CoreWatcher, type MattermostEvent, type WatcherStatus } from "../omp-extension/watcher.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1135,6 +1152,15 @@ function adapterUnderTest(): {
 	return { handlers, sent };
 }
 
+/**
+ * The other integration's own label, as gmail-agents declares it: this line
+ * is shared, so the realistic case is two brands on it, not one.
+ */
+const MAIL_LABEL = { glyph: "\u{f02ab}", text: "mail", verbose: "gmail" } as const;
+
+/** A scratch owner, for composing segments without a live listener behind them. */
+const PROBE_OWNER = "mattermost-label-probe";
+
 async function footerIsOneHonestLine(): Promise<void> {
 	console.log("footer: one line for both integrations, named identities, dead listener marked");
 	const { dir, config, stateDir, origin } = footerWorkspace("line", ["ocai", "ticket500", "norm"]);
@@ -1153,8 +1179,10 @@ async function footerIsOneHonestLine(): Promise<void> {
 	// The other integration registers first, so the order proven below is the
 	// declared one and not the load order.
 	const host = footerHost("footer-line", dir);
-	const mail = registerChannelStatus("gmail", MAIL_ORDER, (key, text) => host.context().ui.setStatus(key, text));
-	mail.set("mail stub@example.test");
+	const mail = registerChannelStatus("gmail", MAIL_ORDER, MAIL_LABEL, (key, text) =>
+		host.context().ui.setStatus(key, text),
+	);
+	mail.set("stub@example.test", { style: "glyph" });
 
 	const { handlers } = adapterUnderTest();
 	await handlers.get("session_start")?.({}, host.context());
@@ -1163,8 +1191,8 @@ async function footerIsOneHonestLine(): Promise<void> {
 	check("one status key, so one rendered line", host.keys().length === 1, host.keys().join(","));
 	check("that key is the shared one", host.keys()[0] === CHANNEL_STATUS_KEY, String(host.keys()[0]));
 	check(
-		"both segments on that line, chat before mail",
-		host.line() === "mm ocai·ticket500!stale·norm!absent │ mail stub@example.test",
+		"both segments on that line, each behind its own brand glyph, chat before mail",
+		host.line() === `${CHANNEL_LABEL.glyph} ocai·ticket500!stale·norm!absent │ ${MAIL_LABEL.glyph} stub@example.test`,
 		String(host.line()),
 	);
 	check(
@@ -1173,15 +1201,101 @@ async function footerIsOneHonestLine(): Promise<void> {
 		String(host.line()),
 	);
 
-	mail.set(undefined);
+	mail.clear();
 	check(
 		"with only one integration the line is that segment alone",
-		host.line() === "mm ocai·ticket500!stale·norm!absent",
+		host.line() === `${CHANNEL_LABEL.glyph} ocai·ticket500!stale·norm!absent`,
 		String(host.line()),
 	);
 
 	await handlers.get("session_shutdown")?.({}, host.context());
 	check("a stopped listener claims no footer space", host.line() === undefined, String(host.line()));
+}
+
+/**
+ * The label, in every style an operator can ask for — composed the way the
+ * live line composes it, through the shared registry, over a scratch owner so
+ * no listener has to be alive to prove it.
+ */
+async function footerLabelIsTheBrandGlyph(): Promise<void> {
+	console.log("footer: the label is the brand glyph, unless the operator says otherwise");
+	check(
+		"the default label is the glyph, and this build's own",
+		DEFAULT_STATUS.label === "glyph" && DEFAULT_STATUS.glyph === null,
+		JSON.stringify(DEFAULT_STATUS),
+	);
+	check(
+		"and that glyph is dev-mattermost U+E927",
+		describeGlyph(CHANNEL_LABEL.glyph) === "\ue927 U+E927",
+		describeGlyph(CHANNEL_LABEL.glyph),
+	);
+
+	const host = footerHost("footer-label", tmpdir());
+	const probe = registerChannelStatus(PROBE_OWNER, CHAT_ORDER, CHANNEL_LABEL, (key, text) =>
+		host.context().ui.setStatus(key, text),
+	);
+	const healthy: SegmentEntry[] = [
+		{ identity: "ocai", marker: null, pending: 0 },
+		{ identity: "ticket500", marker: null, pending: 0 },
+	];
+	const stale: SegmentEntry[] = [
+		{ identity: "ocai", marker: null, pending: 0 },
+		{ identity: "ticket500", marker: "stale", pending: 0 },
+	];
+	/** Exactly what the adapter does per refresh: parse the block, render, compose. */
+	const render = (entries: SegmentEntry[], block: unknown): string | undefined => {
+		const config = parseStatusConfig(block);
+		return probe.set(renderSegmentBody(entries, config), labelChoice(config));
+	};
+	// md-message U+F0361: what an operator whose font predates the Mattermost
+	// logo would reach for.
+	const ownGlyph = "\u{f0361}";
+
+	check(
+		"the default segment is the glyph, one space, the identities",
+		render(healthy, undefined) === `${CHANNEL_LABEL.glyph} ocai·ticket500`,
+		String(render(healthy, undefined)),
+	);
+	check(
+		'label "text" is the short word',
+		render(healthy, { label: "text" }) === "mm ocai·ticket500",
+		String(render(healthy, { label: "text" })),
+	);
+	check(
+		'label "text" is spelled out on a verbose line',
+		render(healthy, { label: "text", style: "verbose" }) === "mattermost ocai, ticket500",
+		String(render(healthy, { label: "text", style: "verbose" })),
+	);
+	check(
+		'label "none" is no label at all',
+		render(healthy, { label: "none" }) === "ocai·ticket500",
+		String(render(healthy, { label: "none" })),
+	);
+	check(
+		"a field list without the label drops it, whatever the style asks for",
+		render(healthy, { fields: ["identity"], label: "glyph" }) === "ocai·ticket500",
+		String(render(healthy, { fields: ["identity"], label: "glyph" })),
+	);
+	check(
+		"a label with no other field is still a segment",
+		render(healthy, { fields: ["label"] }) === CHANNEL_LABEL.glyph,
+		describeGlyph(String(render(healthy, { fields: ["label"] }))),
+	);
+	check(
+		"the operator's own glyph replaces this build's, no release needed",
+		render(healthy, { glyph: ownGlyph }) === `${ownGlyph} ocai·ticket500`,
+		String(render(healthy, { glyph: ownGlyph })),
+	);
+
+	// A label is a name, never a diagnosis: whichever one is in force, the
+	// listener that stopped listening is still named.
+	for (const style of LABEL_STYLES) {
+		const line = render(stale, { label: style }) ?? "";
+		check(`a dead listener is still marked under label "${style}"`, line.includes("ticket500!stale"), line);
+	}
+
+	probe.clear();
+	check("the scratch segment leaves nothing on the line", host.line() === undefined, String(host.line()));
 }
 
 async function footerFieldsAreConfigurable(): Promise<void> {
@@ -1234,6 +1348,12 @@ async function footerConfigIsRefusedLoudly(): Promise<void> {
 		["an unknown field", { fields: ["label", "mailbox"] }],
 		["a field twice", { fields: ["label", "label"] }],
 		["an unknown style", { style: "tiny" }],
+		["an unknown label style", { label: "emoji" }],
+		["a label style that is not a string", { label: true }],
+		["a glyph that is not a string", { glyph: 7 }],
+		["an empty glyph, which would render nothing", { glyph: "" }],
+		["a glyph wider than the label budget", { glyph: "mail" }],
+		["a glyph that is only a control character", { glyph: "\u0007" }],
 	];
 	for (const [label, block] of refusals) {
 		let refused = false;
@@ -1258,13 +1378,17 @@ async function footerConfigIsRefusedLoudly(): Promise<void> {
 	const host = footerHost("footer-refused", dir);
 	const { handlers } = adapterUnderTest();
 	await handlers.get("session_start")?.({}, host.context());
-	await waitFor("the fallback line", () => host.line() === "mm ocai");
+	await waitFor("the fallback line", () => host.line() === `${CHANNEL_LABEL.glyph} ocai`);
 	check(
 		"the session is told, as an error",
 		host.notices.some((notice) => notice.type === "error" && notice.message.includes("status config refused")),
 		JSON.stringify(host.notices),
 	);
-	check("and the line renders the default rather than nothing", host.line() === "mm ocai", String(host.line()));
+	check(
+		"and the line renders the default rather than nothing",
+		host.line() === `${CHANNEL_LABEL.glyph} ocai`,
+		String(host.line()),
+	);
 	await handlers.get("session_shutdown")?.({}, host.context());
 }
 
@@ -1284,6 +1408,7 @@ for (const scenario of [
 	pluginSkillMatchesRoot,
 	pluginWrapper,
 	footerIsOneHonestLine,
+	footerLabelIsTheBrandGlyph,
 	footerFieldsAreConfigurable,
 	footerConfigIsRefusedLoudly,
 ]) {

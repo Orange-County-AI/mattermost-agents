@@ -24,12 +24,29 @@ import { join } from "node:path";
 // The staleness rule and the liveness test, imported rather than restated, so
 // the footer can never disagree with `status` about what "listening" means.
 import { LOCK_STALE_MS, processAlive } from "../../src/agent/state.ts";
+// The label convention is shared with every other channel integration in the
+// process; only the names below are this repository's.
+import {
+	type ChannelLabel,
+	DEFAULT_LABEL_STYLE,
+	LABEL_STYLES,
+	type LabelChoice,
+	type LabelStyle,
+	MAX_LABEL_COLUMNS,
+} from "./channel-status.ts";
 
 /** How this integration is named in the shared registry, and its place in the line. */
 export const STATUS_OWNER = "mattermost";
 
-/** Short for a narrow footer, spelled out when the operator asks for verbose. */
-const LABEL = { compact: "mm", verbose: "mattermost" } as const;
+/**
+ * What this integration is called in the footer. The default is the brand
+ * glyph: `dev-mattermost`, U+E927, from the Nerd Fonts symbol set — a logo is
+ * read faster than two letters, and two letters are what a font without it
+ * falls back to. A build older than the one that added U+E927 draws tofu
+ * there, which `status.label` and `status.glyph` exist to fix without a
+ * release.
+ */
+export const CHANNEL_LABEL: ChannelLabel = { glyph: "\ue927", text: "mm", verbose: "mattermost" };
 
 /**
  * The words `status` reports for a listener, plus `starting` for the moment a
@@ -45,18 +62,31 @@ export const STATUS_FIELDS = ["label", "identity", "count"] as const;
 export type StatusField = (typeof STATUS_FIELDS)[number];
 export type StatusStyle = "compact" | "verbose";
 
+/** Everything a `status` block may say; anything else is refused by name. */
+const STATUS_KEYS = ["fields", "style", "label", "glyph"] as const;
+
 export interface StatusConfig {
 	readonly fields: readonly StatusField[];
 	readonly style: StatusStyle;
+	/** Which form the `label` field takes, when the field is listed at all. */
+	readonly label: LabelStyle;
+	/** The operator's own glyph for this machine's font, or `null` for this build's. */
+	readonly glyph: string | null;
 }
 
 /**
  * Identity, and nothing else. Next to named connections a pending count says
  * little, so it is opt-in; the not-listening marker is not a field at all,
  * because it is the one thing this line exists to make visible and an
- * operator trimming the line must not be able to hide it.
+ * operator trimming the line must not be able to hide it. The label is the
+ * brand glyph, because a footer is scanned rather than read.
  */
-export const DEFAULT_STATUS: StatusConfig = { fields: ["label", "identity"], style: "compact" };
+export const DEFAULT_STATUS: StatusConfig = {
+	fields: ["label", "identity"],
+	style: "compact",
+	label: DEFAULT_LABEL_STYLE,
+	glyph: null,
+};
 
 /** A `status` block that says something this build does not understand. */
 export class StatusConfigError extends Error {}
@@ -69,15 +99,15 @@ export class StatusConfigError extends Error {}
 export function parseStatusConfig(raw: unknown): StatusConfig {
 	if (raw === undefined || raw === null) return DEFAULT_STATUS;
 	if (typeof raw !== "object" || Array.isArray(raw)) {
-		throw new StatusConfigError('"status" must be an object with optional "fields" and "style"');
+		throw new StatusConfigError(`"status" must be an object with optional ${STATUS_KEYS.join(", ")}`);
 	}
 	// Named, and read only key by key below: this is hand-written config, so
 	// every key it carries is checked before anything is believed.
 	const block = raw as Record<string, unknown>;
-	const strange = Object.keys(block).filter((key) => key !== "fields" && key !== "style");
+	const strange = Object.keys(block).filter((key) => !STATUS_KEYS.some((known) => known === key));
 	if (strange.length > 0) {
 		throw new StatusConfigError(
-			`"status" has unknown key(s) ${strange.join(", ")}; it takes only "fields" and "style"`,
+			`"status" has unknown key(s) ${strange.join(", ")}; it takes only ${STATUS_KEYS.join(", ")}`,
 		);
 	}
 
@@ -108,7 +138,48 @@ export function parseStatusConfig(raw: unknown): StatusConfig {
 		style = block.style;
 	}
 
-	return { fields, style };
+	let label = DEFAULT_STATUS.label;
+	if (block.label !== undefined) {
+		const known = LABEL_STYLES.find((candidate) => candidate === block.label);
+		if (known === undefined) {
+			throw new StatusConfigError(
+				`"status.label" must be one of ${LABEL_STYLES.join(", ")}, not ${JSON.stringify(block.label)}`,
+			);
+		}
+		label = known;
+	}
+
+	let glyph = DEFAULT_STATUS.glyph;
+	if (block.glyph !== undefined && block.glyph !== null) {
+		if (typeof block.glyph !== "string") {
+			throw new StatusConfigError(`"status.glyph" must be a string, not ${JSON.stringify(block.glyph)}`);
+		}
+		// Measured in terminal columns, not characters: this is a label on a
+		// line two integrations share, and a glyph that renders as nothing
+		// (empty, a control character) is the failure this check exists for.
+		const columns = Bun.stringWidth(block.glyph);
+		if (columns < 1 || columns > MAX_LABEL_COLUMNS) {
+			throw new StatusConfigError(
+				`"status.glyph" is ${columns} column(s) wide; it must be 1 to ${MAX_LABEL_COLUMNS}`,
+			);
+		}
+		glyph = block.glyph;
+	}
+
+	return { fields, style, label, glyph };
+}
+
+/**
+ * What the shared line should call this integration, given the operator's
+ * block. A label the field list leaves out is no label at all, whatever style
+ * is configured: `fields` says whether, `label` says how.
+ */
+export function labelChoice(config: StatusConfig): LabelChoice {
+	return {
+		style: config.fields.includes("label") ? config.label : "none",
+		verbose: config.style === "verbose",
+		...(config.glyph === null ? {} : { glyph: config.glyph }),
+	};
 }
 
 export interface ProfileConnection {
@@ -314,14 +385,15 @@ export interface SegmentEntry {
 }
 
 /**
- * The segment text, or `undefined` for no segment at all. An unhealthy
- * connection is named whatever the field list says: the operator may shorten
- * this line, never blind it.
+ * Everything the segment says after its label — the label itself belongs to
+ * the shared line, which spaces it. Empty when the operator asked for none of
+ * it; a label alone is still a segment. An unhealthy connection is named
+ * whatever the field list says: the operator may shorten this line, never
+ * blind it.
  */
-export function renderSegment(entries: readonly SegmentEntry[], config: StatusConfig): string | undefined {
+export function renderSegmentBody(entries: readonly SegmentEntry[], config: StatusConfig): string {
 	const compact = config.style === "compact";
 	const parts: string[] = [];
-	if (config.fields.includes("label")) parts.push(compact ? LABEL.compact : LABEL.verbose);
 
 	const withIdentity = config.fields.includes("identity");
 	const named = entries
@@ -340,5 +412,5 @@ export function renderSegment(entries: readonly SegmentEntry[], config: StatusCo
 		if (pending > 0) parts.push(compact ? `↓${pending}` : `${pending} pending`);
 	}
 
-	return parts.length > 0 ? parts.join(" ") : undefined;
+	return parts.join(" ");
 }

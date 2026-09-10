@@ -26,16 +26,18 @@
  * and `status.ts`.
  */
 
-import { CHAT_ORDER, registerChannelStatus } from "./channel-status.ts";
+import { CHAT_ORDER, describeGlyph, registerChannelStatus } from "./channel-status.ts";
 import { CONFIG_ENV } from "./locate.ts";
 import {
+	CHANNEL_LABEL,
 	type ChildState,
 	DEFAULT_STATUS,
+	labelChoice,
 	ListenerStateReader,
 	markerFor,
 	type ProfileFacts,
 	readProfileFacts,
-	renderSegment,
+	renderSegmentBody,
 	type SegmentEntry,
 	STATUS_OWNER,
 } from "./status.ts";
@@ -246,7 +248,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 	 * This integration's segment of the one status line. The publisher reads
 	 * the live session every call, because sessions come and go behind it.
 	 */
-	const segment = registerChannelStatus(STATUS_OWNER, CHAT_ORDER, (key, text) => {
+	const segment = registerChannelStatus(STATUS_OWNER, CHAT_ORDER, CHANNEL_LABEL, (key, text) => {
 		const ctx = bound;
 		if (!ctx?.hasUI) return;
 		try {
@@ -277,7 +279,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		const child = childState();
 		if (child === null) {
 			rendered = undefined;
-			segment.set(undefined);
+			segment.clear();
 			return;
 		}
 		const config = profile?.status ?? DEFAULT_STATUS;
@@ -291,8 +293,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 				}))
 			: // No profile to name an identity from — the marker still speaks.
 				[{ identity: "", marker: markerFor(child, undefined, now), pending: 0 }];
-		rendered = renderSegment(entries, config);
-		segment.set(rendered);
+		rendered = segment.set(renderSegmentBody(entries, config), labelChoice(config));
 	};
 
 	/** Unref'd: a footer refresh never holds the process open. */
@@ -391,7 +392,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		reader = null;
 		profile = null;
 		rendered = undefined;
-		segment.set(undefined);
+		segment.clear();
 		await dying?.stop();
 	};
 
@@ -524,6 +525,9 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 					`queued: ${queue.length}`,
 					`footer: ${rendered ?? "(nothing)"} (status key ${segment.key})`,
 					`footer fields: ${profile?.status.fields.join(", ") || "(none)"} / ${profile?.status.style ?? DEFAULT_STATUS.style}`,
+					// Named codepoint and all: an operator staring at tofu can
+					// read here exactly which character their font is missing.
+					`footer label: ${profile?.status.label ?? DEFAULT_STATUS.label} (${describeGlyph(profile?.status.glyph ?? CHANNEL_LABEL.glyph)})`,
 					...(profile?.statusRefused ? [`footer config REFUSED: ${profile.statusRefused}`] : []),
 					...watcher.diagnostics.slice(-5),
 				].join("\n"),

@@ -74,7 +74,7 @@ is the convention used below — and `chmod 600` it.
 | `operatorUserIds` | your own account(s), by Mattermost user id. A post from one of these arrives as `sender_role="operator"`: it MAY contain instructions and the agent acts on them with its normal judgement. Per connection, because the same human is a different user id on every server. |
 | `automationUserIds` | automation accounts you trust the same way — schedulers, tick loops, CI. They arrive as `sender_role="automation"`. Separate from `operatorUserIds` so the agent can tell a robot from you, and so revoking one never touches the other. |
 | `pollIntervalMs` | REST sweep interval, 1000–600000. Default 5000. |
-| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose" }`, where `fields` is any of `label` (`mm`), `identity` (the connection ids) and `count` (unanswered events). Default `{"fields": ["label", "identity"], "style": "compact"}` — identity, no count. Two things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`), and so is one whose credential was refused (`auth`) or whose config is broken (`config`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
+| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose", "label": "glyph" \| "text" \| "none", "glyph": "…" }`, where `fields` is any of `label`, `identity` (the connection ids) and `count` (unanswered events). Default `{"fields": ["label", "identity"], "style": "compact", "label": "glyph"}` — the brand glyph and the identities, no count. `label` says which form the label takes: `glyph` is the Mattermost logo (`dev-mattermost`, U+E927), `text` is `mm` (`mattermost` on a verbose line), `none` is no label; a `fields` list without `label` renders none of them. `glyph` replaces that logo with any string of one or two terminal columns — for a font that does not have U+E927. Two things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`), and so is one whose credential was refused (`auth`) or whose config is broken (`config`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
 
 Export the token under the name the profile gives, and prove the identity
 before wiring anything into a harness:
@@ -151,15 +151,18 @@ segment first. Nothing here depends on the other integrations existing; with
 only this one installed the line is only this segment.
 
 ```
-mm ticket500·ocai │ mail stub@theticket500.com
+ ticket500·ocai │ 󰊫 stub@theticket500.com
 ```
 
-The default names the identities and nothing else: next to `ocai` a count
-says little, and a footer that talks while everything works is a footer
-nobody reads. What it always says is when something is NOT listening —
+Each segment opens with its integration's brand logo — `dev-mattermost`
+(U+E927) here, `md-gmail` (U+F02AB) for the mailbox — then one space, then
+what it has to say. The default names the identities and nothing else: next
+to `ocai` a count says little, and a footer that talks while everything works
+is a footer nobody reads. What it always says is when something is NOT
+listening —
 
 ```
-mm ticket500!stale·ocai
+ ticket500!stale·ocai
 ```
 
 — and that comes from the listener's own heartbeat in `stateDir`, the same
@@ -167,10 +170,28 @@ rows `status` reads, not from this process's opinion of its child. A
 credential that authenticates proves nothing about whether anything is
 listening; a heartbeat does. The words are the ones `status` uses:
 `retrying`, `stale`, `absent`, `stopped`, plus `auth` for a refused
-credential and `config` for a profile the listener cannot load.
+credential and `config` for a profile the listener cannot load. They stay
+words under every label style: a logo names an integration, it never
+diagnoses one.
 
-The `status` block in the profile chooses the fields and the style (see the
-profile table above); the marker is not a field and cannot be switched off.
+The `status` block in the profile chooses the fields, the style and the label
+(see the profile table above); the marker is not a field and cannot be
+switched off.
+
+**If the label renders as a box.** That is tofu: your terminal font has no
+U+E927. Mattermost's logo needs a Nerd Fonts build at least as new as the one
+that carries U+E927 — the current set has it (3.5.1 does) and older builds may
+not, so installing the current Nerd Fonts *Symbols Only* release is the fix
+that keeps the logo. Gmail's U+F02AB is the easy case: mainstream Nerd Font
+builds have shipped it for years. Two more fixes need no font at all, both in
+the profile's `status` block and neither needing a release: `"label": "text"`
+goes back to `mm`, or `"glyph": "…"` takes any character your font does have —
+paste the character itself, or write it as JSON escapes (`md-message`,
+U+F0361, is `"\udb80\udf61"`: JSON escapes are UTF-16 units, so a codepoint
+above U+FFFF takes a surrogate pair). Anything wider than two terminal
+columns, or empty, is refused at load with the rest of the block.
+`/mattermost status` prints the label style and the codepoint in force, so you
+can read exactly which character your font is missing.
 
 ### Claude Code
 
