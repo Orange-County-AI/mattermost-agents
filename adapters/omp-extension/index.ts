@@ -20,13 +20,34 @@
  * half-typed prompt both survive the notification. Reading settles nothing:
  * replying and acking are explicit model actions through the `mattermost` MCP
  * server, which wraps the same core CLI.
+ *
+ * What the footer says — one line shared with every other channel
+ * integration loaded into the same process — lives in `channel-status.ts`
+ * and `status.ts`.
  */
 
+import { CHAT_ORDER, registerChannelStatus } from "./channel-status.ts";
 import { CONFIG_ENV } from "./locate.ts";
+import {
+	type ChildState,
+	DEFAULT_STATUS,
+	ListenerStateReader,
+	markerFor,
+	type ProfileFacts,
+	readProfileFacts,
+	renderSegment,
+	type SegmentEntry,
+	STATUS_OWNER,
+} from "./status.ts";
 import { CoreWatcher, type MattermostEvent, type WatcherStatus } from "./watcher.ts";
 
 const CUSTOM_TYPE = "mattermost-event";
-const STATUS_KEY = "mattermost";
+/**
+ * How often the footer re-reads the listener's own state. Core heartbeats
+ * every 5s and calls a listener dead at 30s, so this notices a death well
+ * inside that window at the cost of two indexed local queries.
+ */
+const REFRESH_MS = 10_000;
 
 /** Debounce, so a burst of posts wakes the model once. */
 const COALESCE_MS = 400;
@@ -134,22 +155,6 @@ function describe(status: WatcherStatus): string {
 	}
 }
 
-function statusLine(status: WatcherStatus): string | undefined {
-	switch (status.kind) {
-		case "ready":
-			return `mm ${status.connections}`;
-		case "starting":
-		case "restarting":
-			return "mm …";
-		case "failed":
-			return "mm !";
-		// inactive/stopped claim no footer space: nothing is watching, and a
-		// status chip for a listener that does not exist is a lie.
-		default:
-			return undefined;
-	}
-}
-
 /**
  * Attribute values are quoted, so anything that could close the quote, close
  * the tag or start another one is escaped. Newlines and tabs become numeric
@@ -229,12 +234,102 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 	let flushTimer: NodeJS.Timeout | undefined;
 	let batchDeadline = 0;
 
-	const setStatus = (ctx: ExtensionCtx | null, text: string | undefined) => {
+	/** What the footer last rendered for this integration, for `/mattermost status`. */
+	let rendered: string | undefined;
+	let profile: ProfileFacts | null = null;
+	let reader: ListenerStateReader | null = null;
+	let refreshTimer: NodeJS.Timeout | undefined;
+	/** A session this instance refused to bind to: nothing is listening, and the footer says so. */
+	let refusedBinding = false;
+
+	/**
+	 * This integration's segment of the one status line. The publisher reads
+	 * the live session every call, because sessions come and go behind it.
+	 */
+	const segment = registerChannelStatus(STATUS_OWNER, CHAT_ORDER, (key, text) => {
+		const ctx = bound;
 		if (!ctx?.hasUI) return;
 		try {
-			ctx.ui.setStatus(STATUS_KEY, text);
+			ctx.ui.setStatus(key, text);
 		} catch {
 			// A UI that refuses a status chip is not a reason to stop watching.
+		}
+	});
+
+	const childState = (): ChildState | null => {
+		if (refusedBinding) return "failed";
+		switch (watcher?.status.kind) {
+			case "ready":
+				return "running";
+			case "failed":
+				return "failed";
+			case "starting":
+			case "restarting":
+				return "starting";
+			// inactive/stopped claim no footer space: nothing is watching, and
+			// a segment for a listener that does not exist is a lie.
+			default:
+				return null;
+		}
+	};
+
+	const refresh = (): void => {
+		const child = childState();
+		if (child === null) {
+			rendered = undefined;
+			segment.set(undefined);
+			return;
+		}
+		const config = profile?.status ?? DEFAULT_STATUS;
+		const facts = profile && reader ? reader.read(config.fields.includes("count")) : null;
+		const now = Date.now();
+		const entries: SegmentEntry[] = profile
+			? profile.connections.map((connection) => ({
+					identity: connection.identity,
+					marker: markerFor(child, facts?.rows.get(connection.id), now),
+					pending: facts?.pending.get(connection.id) ?? 0,
+				}))
+			: // No profile to name an identity from — the marker still speaks.
+				[{ identity: "", marker: markerFor(child, undefined, now), pending: 0 }];
+		rendered = renderSegment(entries, config);
+		segment.set(rendered);
+	};
+
+	/** Unref'd: a footer refresh never holds the process open. */
+	const startRefreshing = (): void => {
+		if (refreshTimer) return;
+		refreshTimer = setInterval(refresh, REFRESH_MS);
+		refreshTimer.unref?.();
+	};
+
+	/**
+	 * Who this session listens as, and how the operator wants it shown, from
+	 * the profile the watcher resolved — so the footer names the same identity
+	 * the MCP tools act as.
+	 */
+	const loadProfile = (ctx: ExtensionCtx): void => {
+		reader?.close();
+		reader = null;
+		profile = null;
+		const path = watcher?.config;
+		if (!path) return;
+		try {
+			profile = readProfileFacts(path);
+		} catch (error) {
+			// The child reads the same file and fails loudly on it; all the
+			// footer loses is the identity's name.
+			pi.logger?.warn?.(`mattermost: profile unreadable for the status line: ${String(error)}`);
+			return;
+		}
+		reader = new ListenerStateReader(profile.stateDir, (line) => pi.logger?.debug?.(`mattermost: ${line}`));
+		if (profile.statusRefused) {
+			const detail = `status config refused: ${profile.statusRefused}`;
+			pi.logger?.warn?.(`mattermost: ${detail}`);
+			try {
+				if (ctx.hasUI) ctx.ui.notify(`Mattermost ${detail}`, "error");
+			} catch {
+				// A UI that refuses a notification does not change the outcome.
+			}
 		}
 	};
 
@@ -264,6 +359,8 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 				pi.logger?.warn?.("mattermost: delivery failed", { error: String(error) });
 			}
 		});
+		// This batch is new unanswered mail: what a pending count reports moved.
+		refresh();
 	};
 
 	const enqueue = (event: MattermostEvent) => {
@@ -288,7 +385,13 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		queue = [];
 		const dying = watcher;
 		watcher = null;
-		setStatus(bound, undefined);
+		clearInterval(refreshTimer);
+		refreshTimer = undefined;
+		reader?.close();
+		reader = null;
+		profile = null;
+		rendered = undefined;
+		segment.set(undefined);
 		await dying?.stop();
 	};
 
@@ -330,12 +433,13 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 			await stop();
 			bound = ctx;
 			boundKey = null;
+			refusedBinding = true;
 			const failed: WatcherStatus = {
 				kind: "failed",
 				detail: "host supplied no usable session id; refusing to bind a listener to an unidentified session",
 			};
 			pi.logger?.warn?.(`mattermost: ${failed.detail}`);
-			setStatus(ctx, statusLine(failed));
+			refresh();
 			try {
 				if (ctx.hasUI) ctx.ui.notify(`Mattermost watcher ${failed.detail}`, "warning");
 			} catch {
@@ -346,13 +450,14 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		if (watcher && boundKey !== key) await stop();
 		bound = ctx;
 		boundKey = key;
+		refusedBinding = false;
 		if (watcher) return watcher.status;
 		watcher = new CoreWatcher({
 			env: process.env,
 			cwd: ctx.cwd,
 			onEvent: enqueue,
 			onStatus: (status) => {
-				setStatus(bound, statusLine(status));
+				refresh();
 				if (status.kind === "failed") {
 					bound?.ui.notify(`Mattermost watcher ${status.detail}`, "warning");
 				}
@@ -360,6 +465,12 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 			onDiagnostic: (line) => pi.logger?.debug?.(`mattermost: ${line}`),
 		});
 		const status = watcher.start();
+		// The identity is resolved by now, so the footer can name it. Whether
+		// anything is listening it reads from the listener's own state, never
+		// from this value.
+		loadProfile(ctx);
+		startRefreshing();
+		refresh();
 		// Not configured for Mattermost: no child, no notification, no retry loop.
 		if (status.kind === "inactive") pi.logger?.debug?.(`mattermost: ${status.detail}`);
 		return status;
@@ -411,6 +522,9 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 					`identity from: ${watcher.configSource ?? "nothing"}`,
 					`cli: ${watcher.command?.cli ?? "unresolved"}`,
 					`queued: ${queue.length}`,
+					`footer: ${rendered ?? "(nothing)"} (status key ${segment.key})`,
+					`footer fields: ${profile?.status.fields.join(", ") || "(none)"} / ${profile?.status.style ?? DEFAULT_STATUS.style}`,
+					...(profile?.statusRefused ? [`footer config REFUSED: ${profile.statusRefused}`] : []),
 					...watcher.diagnostics.slice(-5),
 				].join("\n"),
 				watcher.status.kind === "failed" ? "warning" : "info",

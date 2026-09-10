@@ -74,6 +74,7 @@ is the convention used below — and `chmod 600` it.
 | `operatorUserIds` | your own account(s), by Mattermost user id. A post from one of these arrives as `sender_role="operator"`: it MAY contain instructions and the agent acts on them with its normal judgement. Per connection, because the same human is a different user id on every server. |
 | `automationUserIds` | automation accounts you trust the same way — schedulers, tick loops, CI. They arrive as `sender_role="automation"`. Separate from `operatorUserIds` so the agent can tell a robot from you, and so revoking one never touches the other. |
 | `pollIntervalMs` | REST sweep interval, 1000–600000. Default 5000. |
+| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose" }`, where `fields` is any of `label` (`mm`), `identity` (the connection ids) and `count` (unanswered events). Default `{"fields": ["label", "identity"], "style": "compact"}` — identity, no count. Two things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`), and so is one whose credential was refused (`auth`) or whose config is broken (`config`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
 
 Export the token under the name the profile gives, and prove the identity
 before wiring anything into a harness:
@@ -138,6 +139,38 @@ The extension delivers messages and owns `/mattermost`; it ships no skill of
 its own. Give the agent the operating rules by installing this repository's
 root `SKILL.md` wherever that harness loads skills from — copy it, or symlink
 it if your loader follows links. It is the canonical text for both harnesses.
+
+#### What the footer shows
+
+One line, whatever else is loaded. OMP renders one footer line per status key
+— measured in its status-line component, which sorts the keys and pushes a
+line each — so this extension does not take a key of its own: it writes a
+segment into a small `globalThis` registry under the shared key `channels`,
+and every channel integration in the process draws the same joined line, chat
+segment first. Nothing here depends on the other integrations existing; with
+only this one installed the line is only this segment.
+
+```
+mm ticket500·ocai │ mail stub@theticket500.com
+```
+
+The default names the identities and nothing else: next to `ocai` a count
+says little, and a footer that talks while everything works is a footer
+nobody reads. What it always says is when something is NOT listening —
+
+```
+mm ticket500!stale·ocai
+```
+
+— and that comes from the listener's own heartbeat in `stateDir`, the same
+rows `status` reads, not from this process's opinion of its child. A
+credential that authenticates proves nothing about whether anything is
+listening; a heartbeat does. The words are the ones `status` uses:
+`retrying`, `stale`, `absent`, `stopped`, plus `auth` for a refused
+credential and `config` for a profile the listener cannot load.
+
+The `status` block in the profile chooses the fields and the style (see the
+profile table above); the marker is not a field and cannot be switched off.
 
 ### Claude Code
 

@@ -16,6 +16,9 @@
  *     native notifications, waking the model once,
  *   - lifecycle: a terminal exit does not restart-loop, a crash does, and
  *     stopping leaves no orphan.
+ *   - the footer: one rendered line for every channel integration in the
+ *     process, naming the identities, always marking a listener that is not
+ *     listening, and refusing a status config it does not understand.
  *
  * Deliberately outside `bun test`'s pattern so it never runs as part of the
  * core suite.
@@ -36,7 +39,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AgentState, WatcherHealth } from "../../src/agent/state.ts";
+import { CHANNEL_STATUS_KEY, MAIL_ORDER, registerChannelStatus } from "../omp-extension/channel-status.ts";
 import mattermostAdapter, { formatDelivery, type ExtensionApi, type ExtensionCtx } from "../omp-extension/index.ts";
+import { DEFAULT_STATUS, parseStatusConfig, readProfileFacts, StatusConfigError } from "../omp-extension/status.ts";
 import { CoreWatcher, type MattermostEvent, type WatcherStatus } from "../omp-extension/watcher.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1009,6 +1015,254 @@ async function pluginWrapper(): Promise<void> {
 	check("it emits no events", stdout === "", stdout);
 }
 
+/**
+ * A profile with the connections a footer test needs, and whatever the
+ * operator put in its `status` block. Core-valid, because the footer reads the
+ * same file core does.
+ */
+function footerWorkspace(
+	name: string,
+	connections: string[],
+	status?: unknown,
+): { dir: string; config: string; stateDir: string; origin: string } {
+	const dir = mkdtempSync(join(tmpdir(), `mm-footer-${name}-`));
+	const stateDir = join(dir, "state");
+	const url = "https://mattermost.example.invalid";
+	const config = join(dir, "profile.json");
+	writeFileSync(
+		config,
+		JSON.stringify({
+			version: 1,
+			stateDir,
+			connections: connections.map((id) => ({
+				id,
+				url,
+				tokenEnv: "TEST_MM_TOKEN",
+				channelIds: ["channel1"],
+				allowedBotIds: [],
+				pollIntervalMs: 5000,
+			})),
+			...(status === undefined ? {} : { status }),
+		}),
+	);
+	return { dir, config, stateDir, origin: new URL(url).origin };
+}
+
+/** What core's own writer records about a listener; the footer reads exactly this. */
+function recordListener(
+	stateDir: string,
+	origin: string,
+	row: { connection: string; reported: "listening" | "retrying" | "stopped"; ageMs?: number; error?: { text: string; kind: string } },
+): void {
+	const health = WatcherHealth.open(stateDir);
+	health.report({
+		connectionId: row.connection,
+		origin,
+		reported: row.reported,
+		error: row.error,
+		now: Date.now() - (row.ageMs ?? 0),
+	});
+	health.close();
+}
+
+/** Unacked events, stored the way a sweep stores them. */
+function recordPending(stateDir: string, origin: string, connection: string, count: number): void {
+	const state = AgentState.open({ stateDir, connectionId: connection, origin, userId: "user1" });
+	const now = Date.now();
+	state.commitSweep({
+		channelId: "channel1",
+		checkpoint: now,
+		events: Array.from({ length: count }, (_unused, index) => ({
+			event_id: `${connection}:post${index}`,
+			connection,
+			post_id: `post${index}`,
+			channel_id: "channel1",
+			root_id: "",
+			sender_id: "user1",
+			sender_username: "user1name",
+			text: `hello ${index}`,
+			created_at: now,
+			updated_at: now,
+		})),
+	});
+	state.close();
+}
+
+interface FooterHost {
+	context(): ExtensionCtx;
+	/** Every `setStatus` call in order — a footer is a sequence of writes, not a value. */
+	writes: { key: string; text: string | undefined }[];
+	notices: { message: string; type: string }[];
+	/** Keys that ever carried text: one rendered line means exactly one key. */
+	keys(): string[];
+	line(): string | undefined;
+}
+
+function footerHost(id: string, cwd: string): FooterHost {
+	const writes: { key: string; text: string | undefined }[] = [];
+	const notices: { message: string; type: string }[] = [];
+	return {
+		writes,
+		notices,
+		keys: () => [...new Set(writes.filter((write) => write.text !== undefined).map((write) => write.key))],
+		line: () => writes.at(-1)?.text,
+		context: () => ({
+			hasUI: true,
+			cwd,
+			sessionManager: { getSessionId: () => id },
+			ui: {
+				notify: (message: string, type?: string) => notices.push({ message, type: type ?? "info" }),
+				setStatus: (key: string, text: string | undefined) => writes.push({ key, text }),
+			},
+		}),
+	};
+}
+
+/** One adapter instance driven by hand, with its handlers to hand. */
+function adapterUnderTest(): {
+	handlers: Map<string, (event: unknown, ctx: ExtensionCtx) => unknown>;
+	sent: SentMessage[];
+} {
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionCtx) => unknown>();
+	const sent: SentMessage[] = [];
+	const pi: ExtensionApi = {
+		setLabel: () => {},
+		on: (event, handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+		sendMessage: (message, options) => sent.push({ ...message, ...options }),
+	};
+	mattermostAdapter(pi);
+	return { handlers, sent };
+}
+
+async function footerIsOneHonestLine(): Promise<void> {
+	console.log("footer: one line for both integrations, named identities, dead listener marked");
+	const { dir, config, stateDir, origin } = footerWorkspace("line", ["ocai", "ticket500"]);
+	recordListener(stateDir, origin, { connection: "ocai", reported: "listening" });
+	// A heartbeat this old is what a dead listener looks like, whatever the
+	// credential says. This is the case that went unnoticed for eight hours.
+	recordListener(stateDir, origin, { connection: "ticket500", reported: "listening", ageMs: 60_000 });
+	recordPending(stateDir, origin, "ocai", 2);
+
+	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
+	process.env.MATTERMOST_AGENT_CONFIG = config;
+	process.env.FAKE_CORE_EVENTS = "0";
+	delete process.env.FAKE_CORE_SPAWN_LOG;
+
+	// The other integration registers first, so the order proven below is the
+	// declared one and not the load order.
+	const host = footerHost("footer-line", dir);
+	const mail = registerChannelStatus("gmail", MAIL_ORDER, (key, text) => host.context().ui.setStatus(key, text));
+	mail.set("mail stub@example.test");
+
+	const { handlers } = adapterUnderTest();
+	await handlers.get("session_start")?.({}, host.context());
+	await waitFor("the footer to mark the dead listener", () => (host.line() ?? "").includes("!stale"));
+
+	check("one status key, so one rendered line", host.keys().length === 1, host.keys().join(","));
+	check("that key is the shared one", host.keys()[0] === CHANNEL_STATUS_KEY, String(host.keys()[0]));
+	check(
+		"both segments on that line, chat before mail",
+		host.line() === "mm ocai·ticket500!stale │ mail stub@example.test",
+		String(host.line()),
+	);
+	check(
+		"the default names identities and counts nothing",
+		!/\d/.test((host.line() ?? "").replace("stub@example.test", "").replace("ticket500", "")),
+		String(host.line()),
+	);
+
+	mail.set(undefined);
+	check("with only one integration the line is that segment alone", host.line() === "mm ocai·ticket500!stale", String(host.line()));
+
+	await handlers.get("session_shutdown")?.({}, host.context());
+	check("a stopped listener claims no footer space", host.line() === undefined, String(host.line()));
+}
+
+async function footerFieldsAreConfigurable(): Promise<void> {
+	console.log("footer: the operator picks the fields, and cannot switch off a marker");
+	const chosen = footerWorkspace("fields", ["ocai", "ticket500"], { fields: ["identity"], style: "compact" });
+	recordListener(chosen.stateDir, chosen.origin, { connection: "ocai", reported: "listening" });
+	recordListener(chosen.stateDir, chosen.origin, { connection: "ticket500", reported: "listening" });
+
+	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
+	process.env.MATTERMOST_AGENT_CONFIG = chosen.config;
+	process.env.FAKE_CORE_EVENTS = "0";
+
+	const identityHost = footerHost("footer-fields", chosen.dir);
+	const identityOnly = adapterUnderTest();
+	await identityOnly.handlers.get("session_start")?.({}, identityHost.context());
+	await waitFor("the configured line", () => identityHost.line() === "ocai·ticket500");
+	check("exactly the configured fields, in the segment's order", identityHost.line() === "ocai·ticket500", String(identityHost.line()));
+	await identityOnly.handlers.get("session_shutdown")?.({}, identityHost.context());
+
+	// Label and identity switched off, and a refused credential on one
+	// connection: the marker names it anyway, because that is the one thing
+	// this line exists for.
+	const trimmed = footerWorkspace("trimmed", ["ocai", "ticket500"], { fields: ["count"], style: "verbose" });
+	recordListener(trimmed.stateDir, trimmed.origin, { connection: "ocai", reported: "listening" });
+	recordListener(trimmed.stateDir, trimmed.origin, {
+		connection: "ticket500",
+		reported: "retrying",
+		error: { text: "401 from the server", kind: "identity" },
+	});
+	recordPending(trimmed.stateDir, trimmed.origin, "ocai", 2);
+	process.env.MATTERMOST_AGENT_CONFIG = trimmed.config;
+
+	const trimmedHost = footerHost("footer-trimmed", trimmed.dir);
+	const countOnly = adapterUnderTest();
+	await countOnly.handlers.get("session_start")?.({}, trimmedHost.context());
+	await waitFor("the trimmed line", () => (trimmedHost.line() ?? "").includes("(auth)"));
+	check(
+		"a refused credential stays visible with every field switched off, and the count is verbose",
+		trimmedHost.line() === "ticket500 (auth) 2 pending",
+		String(trimmedHost.line()),
+	);
+	await countOnly.handlers.get("session_shutdown")?.({}, trimmedHost.context());
+}
+
+async function footerConfigIsRefusedLoudly(): Promise<void> {
+	console.log("footer: a status block this build does not understand is refused, out loud");
+	const refusals: [string, unknown][] = [
+		["not an object", "compact"],
+		["an unknown key", { fields: ["label"], colour: "red" }],
+		["an unknown field", { fields: ["label", "mailbox"] }],
+		["a field twice", { fields: ["label", "label"] }],
+		["an unknown style", { style: "tiny" }],
+	];
+	for (const [label, block] of refusals) {
+		let refused = false;
+		try {
+			parseStatusConfig(block);
+		} catch (error) {
+			refused = error instanceof StatusConfigError;
+		}
+		check(`refuses ${label}`, refused, JSON.stringify(block));
+	}
+	check("an absent block is the default, not an error", parseStatusConfig(undefined).fields === DEFAULT_STATUS.fields);
+
+	const { dir, config, stateDir, origin } = footerWorkspace("refused", ["ocai"], { fields: ["nope"] });
+	recordListener(stateDir, origin, { connection: "ocai", reported: "listening" });
+	const facts = readProfileFacts(config);
+	check("the refusal is reported, not applied", facts.statusRefused !== null, String(facts.statusRefused));
+	check("and the default is in force instead", facts.status.style === DEFAULT_STATUS.style, JSON.stringify(facts.status));
+
+	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
+	process.env.MATTERMOST_AGENT_CONFIG = config;
+	process.env.FAKE_CORE_EVENTS = "0";
+	const host = footerHost("footer-refused", dir);
+	const { handlers } = adapterUnderTest();
+	await handlers.get("session_start")?.({}, host.context());
+	await waitFor("the fallback line", () => host.line() === "mm ocai");
+	check(
+		"the session is told, as an error",
+		host.notices.some((notice) => notice.type === "error" && notice.message.includes("status config refused")),
+		JSON.stringify(host.notices),
+	);
+	check("and the line renders the default rather than nothing", host.line() === "mm ocai", String(host.line()));
+	await handlers.get("session_shutdown")?.({}, host.context());
+}
+
 for (const scenario of [
 	identityIsExplicit,
 	projectProfileActivates,
@@ -1024,6 +1278,9 @@ for (const scenario of [
 	projectInstaller,
 	pluginSkillMatchesRoot,
 	pluginWrapper,
+	footerIsOneHonestLine,
+	footerFieldsAreConfigurable,
+	footerConfigIsRefusedLoudly,
 ]) {
 	await scenario();
 }
