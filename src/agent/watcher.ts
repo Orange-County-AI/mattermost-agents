@@ -46,6 +46,12 @@ export interface WatcherIo {
   emit(line: string): void
   /** Diagnostics. stderr, never a turn. */
   log(line: string): void
+  /**
+   * A server-side failure this watcher rode out, or `null` once a whole tick
+   * came back clean. Optional because it is diagnostics only: the watcher
+   * never stops for one of these, it just lets `status` say so out loud.
+   */
+  transient?(error: string | null): void
 }
 
 export interface MessageLine {
@@ -93,6 +99,8 @@ export class ConnectionWatcher {
   private reconnectDelay = 1000
   private sweeping = false
   private stopped = false
+  /** The last server-side failure inside the current tick; diagnostics only. */
+  private lastFailure: string | undefined
 
   constructor(
     private readonly conn: ConnectionConfig,
@@ -132,9 +140,14 @@ export class ConnectionWatcher {
   }
 
   private async tick(): Promise<void> {
+    this.lastFailure = undefined
     await this.refreshScope()
-    await this.sweepAll()
+    const swept = await this.sweepAll()
     this.drain()
+    // Diagnostics only, and only when a sweep actually ran: an operator
+    // reading `status` should see a listener that is alive but getting 502s,
+    // rather than having to guess it from stderr.
+    if (swept) this.io.transient?.(this.lastFailure ?? null)
   }
 
   /**
@@ -150,6 +163,7 @@ export class ConnectionWatcher {
     try {
       await this.scope.refresh()
     } catch (err) {
+      this.lastFailure = errorText(err)
       this.io.log(`warn connection=${this.conn.id} membership refresh failed: ${errorText(err)}`)
       return
     }
@@ -159,21 +173,27 @@ export class ConnectionWatcher {
     }
   }
 
-  /** Sequential, one channel at a time: a failure stops at that channel's checkpoint. */
-  private async sweepAll(): Promise<void> {
-    if (this.sweeping || this.stopped) return
+  /**
+   * Sequential, one channel at a time: a failure stops at that channel's
+   * checkpoint. Answers whether it ran at all — a tick that collided with an
+   * in-flight sweep has verified nothing and must not report a clean pass.
+   */
+  private async sweepAll(): Promise<boolean> {
+    if (this.sweeping || this.stopped) return false
     this.sweeping = true
     try {
       for (const channelId of this.scope.channels()) {
         try {
           await this.sweepChannel(channelId)
         } catch (err) {
+          this.lastFailure = errorText(err)
           this.io.log(`warn connection=${this.conn.id} channel=${channelId} sweep failed: ${errorText(err)}`)
         }
       }
     } finally {
       this.sweeping = false
     }
+    return true
   }
 
   private async sweepChannel(channelId: string): Promise<void> {

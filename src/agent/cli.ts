@@ -13,11 +13,13 @@
  * There is no provisioning command here on purpose: creating accounts and
  * handing out credentials is an operator job (src/admin), never an agent one.
  */
+import { hostname } from 'node:os'
 import {
   closeSessions,
   createPost,
   listPending,
   markHandled,
+  openFailureKind,
   openSession,
   openSessions,
   BackendError,
@@ -37,8 +39,9 @@ import {
   searchUsers,
   whoami,
 } from './collab'
-import { ConfigError, loadConfig, soleConnectionId, type AgentConfig } from './config'
+import { ConfigError, loadConfig, soleConnectionId, type AgentConfig, type ConnectionConfig } from './config'
 import { runMcpServer } from './mcp'
+import { processAlive, WatcherHealth, LOCK_STALE_MS } from './state'
 import { ConnectionWatcher, errorText } from './watcher'
 
 const EXIT_UNEXPECTED = 1
@@ -348,8 +351,43 @@ function reportOpenFailure(err: unknown): number {
     log(`identity-error: ${err.message}`)
     return EXIT_AUTH
   }
-  log(`auth-error: ${errorText(err)}`)
-  return EXIT_AUTH
+  if (openFailureKind(err) === 'identity') {
+    log(`auth-error: ${errorText(err)}`)
+    return EXIT_AUTH
+  }
+  // A one-shot command cannot wait out a rebooting server, but it must not
+  // claim the credential was refused either: that is what sends an operator
+  // hunting a token that was never wrong.
+  log(`transient-error: ${errorText(err)}`)
+  return EXIT_UNEXPECTED
+}
+
+/**
+ * How the watcher itself is doing, read from the heartbeat the resident
+ * supervisor writes — NOT from this process's own network call. `health` says
+ * whether the credential works right now; only this says whether anything is
+ * still listening, which is the question four deaf agents answered wrong.
+ */
+interface WatcherStatus {
+  /**
+   * listening — a resident supervisor is sweeping this connection;
+   * retrying — it is resident but the connection will not open, and it keeps
+   * trying; stopped — it shut down cleanly; stale — it last claimed to be
+   * running but its heartbeat died, so nothing is listening; absent — no
+   * watcher has ever run against this state directory.
+   */
+  state: 'listening' | 'retrying' | 'stopped' | 'stale' | 'absent'
+  pid?: number
+  host?: string
+  heartbeat_at?: number
+  /** Age of that heartbeat. Anything past LOCK_STALE_MS means nobody is home. */
+  heartbeat_age_ms?: number
+  /** Attempts spent on the current open; 0 once it is listening. */
+  attempts?: number
+  /** The last failure this connection rode out, kept even after it recovered. */
+  last_error?: string
+  last_error_kind?: string
+  last_error_at?: number
 }
 
 interface ConnectionStatus {
@@ -357,10 +395,12 @@ interface ConnectionStatus {
   url: string
   /**
    * "live" once the identity resolved; "identity-mismatch" when the credential
-   * belongs to a different user than the config pins it to; "unreachable"
-   * carries any other reason instead.
+   * belongs to a different user than the config pins it to; "auth-refused"
+   * when the server definitively refused the credential (401/403);
+   * "unreachable" for everything transient — a 5xx, a proxy error page, a
+   * timeout, a refused connection — which is retried, never fatal.
    */
-  health: 'live' | 'unreachable' | 'identity-mismatch'
+  health: 'live' | 'unreachable' | 'auth-refused' | 'identity-mismatch'
   error?: string
   authenticated_as?: { id: string; username: string }
   /** How this connection decides what it watches. */
@@ -368,50 +408,105 @@ interface ConnectionStatus {
   channels?: { channel_id: string; checkpoint: number | null }[]
   pending?: number
   watcher_lock?: { pid: number; host: string; heartbeat_at: number } | null
+  watcher: WatcherStatus
   gaps?: { channel_id: string; from_ms: number; to_ms: number; observed: number }[]
+}
+
+/**
+ * Read one connection's recorded liveness. A heartbeat older than
+ * LOCK_STALE_MS — or a same-host pid that is gone — means the process that
+ * wrote it is not there any more, whatever it last claimed to be doing.
+ */
+function watcherStatus(health: WatcherHealth, connectionId: string, origin: string, now = Date.now()): WatcherStatus {
+  const row = health.read(connectionId, origin)
+  if (!row) return { state: 'absent' }
+  const age = now - row.heartbeat_at
+  const gone = row.reported !== 'stopped' && (age > LOCK_STALE_MS || (row.host === hostname() && !processAlive(row.pid)))
+  return {
+    state: gone ? 'stale' : row.reported,
+    pid: row.pid,
+    host: row.host,
+    heartbeat_at: row.heartbeat_at,
+    heartbeat_age_ms: age,
+    attempts: row.attempts,
+    ...(row.last_error ? { last_error: row.last_error } : {}),
+    ...(row.last_error_kind ? { last_error_kind: row.last_error_kind } : {}),
+    ...(row.last_error_at ? { last_error_at: row.last_error_at } : {}),
+  }
 }
 
 /** Never fails as a whole: one dead server is reported as one unreachable row. */
 async function status(config: AgentConfig, connectionId?: string): Promise<ConnectionStatus[]> {
   const conns = connectionId ? config.connections.filter((c) => c.id === connectionId) : config.connections
   const rows: ConnectionStatus[] = []
-  for (const conn of conns) {
-    let session: Session
-    try {
-      session = await openSession(config, conn.id)
-    } catch (err) {
+  const health = WatcherHealth.open(config.stateDir)
+  try {
+    for (const conn of conns) {
+      // Read the watcher's own liveness FIRST and unconditionally: it is keyed
+      // by connection + origin, so it still answers when the identity call is
+      // the thing that is broken.
+      const watcher = watcherStatus(health, conn.id, new URL(conn.url).origin)
+      let session: Session
+      try {
+        session = await openSession(config, conn.id)
+      } catch (err) {
+        rows.push({
+          connection: conn.id,
+          url: conn.url,
+          health:
+            err instanceof IdentityError
+              ? 'identity-mismatch'
+              : openFailureKind(err) === 'identity'
+                ? 'auth-refused'
+                : 'unreachable',
+          error: errorText(err),
+          watcher,
+        })
+        continue
+      }
+      const holder = session.state.lockHolder()
       rows.push({
         connection: conn.id,
         url: conn.url,
-        health: err instanceof IdentityError ? 'identity-mismatch' : 'unreachable',
-        error: errorText(err),
+        health: 'live',
+        authenticated_as: { id: session.selfUserId, username: session.selfUsername },
+        scope: session.scope.mode,
+        channels: session.scope
+          .channels()
+          .map((channel_id) => ({ channel_id, checkpoint: session.state.checkpoint(channel_id) ?? null })),
+        pending: session.state.pending(1000).length,
+        watcher_lock: holder ? { pid: holder.pid, host: holder.host, heartbeat_at: holder.heartbeat_at } : null,
+        watcher,
+        gaps: session.state
+          .gaps()
+          .map(({ channel_id, from_ms, to_ms, observed }) => ({ channel_id, from_ms, to_ms, observed })),
       })
-      continue
+      session.state.close()
     }
-    const holder = session.state.lockHolder()
-    rows.push({
-      connection: conn.id,
-      url: conn.url,
-      health: 'live',
-      authenticated_as: { id: session.selfUserId, username: session.selfUsername },
-      scope: session.scope.mode,
-      channels: session.scope
-        .channels()
-        .map((channel_id) => ({ channel_id, checkpoint: session.state.checkpoint(channel_id) ?? null })),
-      pending: session.state.pending(1000).length,
-      watcher_lock: holder ? { pid: holder.pid, host: holder.host, heartbeat_at: holder.heartbeat_at } : null,
-      gaps: session.state.gaps().map(({ channel_id, from_ms, to_ms, observed }) => ({ channel_id, from_ms, to_ms, observed })),
-    })
-    session.state.close()
+  } finally {
+    health.close()
   }
   return rows
 }
 
-/** Bounded retry for a connection that is down: 1s doubling to a minute. */
+/**
+ * Retry pacing for a connection that will not open: 1s doubling to a minute,
+ * then a minute forever. There is deliberately NO attempt cap — a listener
+ * that stops listening is the failure this pacing exists to prevent, and a
+ * server that is rebooting behind a proxy can 502 for minutes.
+ */
 const RETRY_BASE_MS = 1000
 const RETRY_MAX_MS = 60_000
 
-type ConnectionOutcome = 'live' | 'lock-held' | 'auth' | 'config'
+/**
+ * What one attempt to bring a connection up produced.
+ *
+ * `identity` is the only outcome that may end this process: the server
+ * definitively refused the credential, or the credential is somebody else's.
+ * `transient` never does — it is a server or a network that has not answered
+ * yet, and the honest response is to say so, back off, and keep trying.
+ */
+type ConnectionOutcome = 'live' | 'lock-held' | 'identity' | 'transient' | 'config'
 
 /**
  * One supervisor per configured connection. Connections are independent by
@@ -419,15 +514,41 @@ type ConnectionOutcome = 'live' | 'lock-held' | 'auth' | 'config'
  * connection that keeps retrying, and never stops another connection's
  * listener or delays its mail. Signal handlers are installed before any network
  * I/O, so a hung startup is still killable and only owned locks are released.
+ *
+ * The process stays resident while ANY connection is still worth retrying,
+ * including when none has opened yet. Exiting on a transient failure is what
+ * turned a fifteen-second reboot into an eight-hour silence: the credential
+ * was never refused, so nothing about stopping was correct.
  */
 async function watch(config: AgentConfig): Promise<number> {
   const running = new Map<string, { session: Session; watcher: ConnectionWatcher }>()
-  const outcomes = new Map<string, ConnectionOutcome>()
   const retryTimers = new Set<ReturnType<typeof setTimeout>>()
+  const health = WatcherHealth.open(config.stateDir)
+  const origins = new Map(config.connections.map((conn) => [conn.id, new URL(conn.url).origin]))
+  /** What this process is currently doing per connection, for the heartbeat to keep fresh. */
+  const reported = new Map<string, { state: 'listening' | 'retrying'; attempts: number }>()
   let stopping = false
 
+  const origin = (id: string): string => origins.get(id) ?? ''
+  const note = (
+    conn: ConnectionConfig,
+    state: 'listening' | 'retrying',
+    attempts: number,
+    error?: { text: string; kind: string },
+  ): void => {
+    reported.set(conn.id, { state, attempts })
+    health.report({ connectionId: conn.id, origin: origin(conn.id), reported: state, attempts, error })
+  }
+
   const heartbeat = setInterval(() => {
-    for (const { session } of running.values()) session.state.heartbeat()
+    const now = Date.now()
+    for (const { session } of running.values()) session.state.heartbeat(now)
+    // The listener's own liveness, written whether or not the connection is
+    // open: this is the signal `status` reads, and a retrying watcher is very
+    // much alive.
+    for (const [id, current] of reported) {
+      health.report({ connectionId: id, origin: origin(id), reported: current.state, attempts: current.attempts, now })
+    }
   }, HEARTBEAT_MS)
 
   const { promise, resolve } = Promise.withResolvers<number>()
@@ -442,54 +563,80 @@ async function watch(config: AgentConfig): Promise<number> {
       session.state.releaseLock()
       session.state.close()
     }
+    // Say it out loud rather than deleting the row: "this listener stopped at
+    // T" is what an operator needs to read after an agent went quiet.
+    for (const id of reported.keys()) {
+      health.report({ connectionId: id, origin: origin(id), reported: 'stopped', attempts: 0 })
+    }
+    health.close()
     resolve(0)
   }
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGTERM', () => shutdown('SIGTERM'))
 
-  const bring = async (conn: (typeof config.connections)[number], attempt: number): Promise<ConnectionOutcome> => {
+  const bring = async (conn: ConnectionConfig, attempt: number): Promise<ConnectionOutcome> => {
     if (stopping) return 'config'
     let session: Session
     try {
       session = await openSession(config, conn.id)
     } catch (err) {
-      // An identity mismatch is retried like any other credential failure —
-      // the token can be put back — but it is never logged as a plain auth
-      // error, because the remedy is completely different.
-      const reason =
-        err instanceof ConfigError ? 'config-error' : err instanceof IdentityError ? 'identity-error' : 'auth-error'
+      if (err instanceof ConfigError) {
+        log(`config-error: connection=${conn.id} DEGRADED (attempt ${attempt}): ${errorText(err)}`)
+        note(conn, 'retrying', attempt, { text: errorText(err), kind: 'config' })
+        return 'config'
+      }
+      // Three different remedies, so three different words. An identity
+      // mismatch needs the right token put back; a refusal needs a valid one;
+      // a transient failure needs nothing but patience, and saying "auth" for
+      // it is what sent operators hunting a credential that was never wrong.
+      const kind = openFailureKind(err)
+      const reason = err instanceof IdentityError ? 'identity-error' : kind === 'identity' ? 'auth-error' : 'transient-error'
       log(`${reason}: connection=${conn.id} DEGRADED (attempt ${attempt}): ${errorText(err)}`)
-      return err instanceof ConfigError ? 'config' : 'auth'
+      note(conn, 'retrying', attempt, { text: errorText(err), kind })
+      return kind
     }
     const lock = session.state.acquireLock()
     if (!lock.ok) {
       log(`lock-held: pid=${lock.holder.pid} host=${lock.holder.host} scope=${session.state.scope}`)
       session.state.close()
+      // Deliberately no health report: the holder owns this connection's
+      // liveness story, and stamping our pid over it would make a live
+      // listener look dead.
       return 'lock-held'
     }
     const watcher = new ConnectionWatcher(conn, session.client, session.state, session.token, session.selfUserId, {
       emit: (line) => process.stdout.write(`${line}\n`),
       log,
+      transient: (error) =>
+        health.report({
+          connectionId: conn.id,
+          origin: origin(conn.id),
+          reported: 'listening',
+          attempts: 0,
+          error: error ? { text: error, kind: 'transient' } : null,
+        }),
     })
     try {
       await watcher.start()
     } catch (err) {
-      log(`warn: connection=${conn.id} DEGRADED (attempt ${attempt}): ${errorText(err)}`)
+      log(`transient-error: connection=${conn.id} DEGRADED (attempt ${attempt}): ${errorText(err)}`)
       watcher.stop()
       session.state.releaseLock()
       session.state.close()
-      return 'auth'
+      note(conn, 'retrying', attempt, { text: errorText(err), kind: openFailureKind(err) })
+      return 'transient'
     }
     running.set(conn.id, { session, watcher })
+    note(conn, 'listening', 0)
     return 'live'
   }
 
-  const supervise = async (conn: (typeof config.connections)[number], attempt: number): Promise<ConnectionOutcome> => {
+  const supervise = async (conn: ConnectionConfig, attempt: number): Promise<ConnectionOutcome> => {
     const outcome = await bring(conn, attempt)
-    outcomes.set(conn.id, outcome)
     // A held lock is another live watcher's territory; retrying would fight it.
-    // Everything else — bad token, DNS, refused connection, 5xx — is retried,
-    // because the server coming back must not need a restart here.
+    // Everything else — an unreachable server, a 5xx, a refused credential
+    // that may yet be replaced in the secret store — is retried forever,
+    // because a server or a token coming back must not need a restart here.
     if (outcome !== 'live' && outcome !== 'lock-held' && !stopping) {
       const delay = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS)
       const timer = setTimeout(() => {
@@ -511,11 +658,21 @@ async function watch(config: AgentConfig): Promise<number> {
     shutdown('config-error')
     return EXIT_CONFIG
   }
-  if (live === 0 && !first.includes('lock-held')) {
+  // Exit 4 keeps meaning exactly what the README says: a credential a human
+  // must fix. Only definite refusals qualify, and only when nothing else is
+  // worth waiting for.
+  if (live === 0 && first.every((o) => o === 'identity' || o === 'config') && first.includes('identity')) {
     shutdown('auth-error')
     return EXIT_AUTH
   }
-  log(`ready connections=${live} degraded=${first.length - live}`)
+  if (live === 0) {
+    log(
+      `degraded connections=0 retrying=${first.filter((o) => o === 'transient' || o === 'identity').length} ` +
+        '— nothing is listening yet; staying resident and retrying',
+    )
+  } else {
+    log(`ready connections=${live} degraded=${first.length - live}`)
+  }
   return promise
 }
 

@@ -73,6 +73,28 @@ export interface LockHolder {
   heartbeat_at: number
 }
 
+/**
+ * What the supervisor last recorded about one connection's listener. Keyed by
+ * connection id + server origin ONLY — deliberately not by the authenticated
+ * user, because the question "is my listener alive?" has to be answerable
+ * exactly when the identity call is the thing that is failing.
+ */
+export interface WatcherHealthRow {
+  connection_id: string
+  origin: string
+  pid: number
+  host: string
+  /** What the supervisor was doing: listening, retrying a failed open, or shut down cleanly. */
+  reported: 'listening' | 'retrying' | 'stopped'
+  /** How many times the current open has been attempted; 0 once it is listening. */
+  attempts: number
+  last_error: string | null
+  last_error_kind: string | null
+  last_error_at: number | null
+  started_at: number
+  heartbeat_at: number
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
   scope TEXT NOT NULL,
@@ -123,6 +145,20 @@ CREATE TABLE IF NOT EXISTS watcher_lock (
   scope TEXT PRIMARY KEY,
   pid INTEGER NOT NULL,
   host TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS watcher_health (
+  key TEXT PRIMARY KEY,
+  connection_id TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  host TEXT NOT NULL,
+  reported TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_error_kind TEXT,
+  last_error_at INTEGER,
   started_at INTEGER NOT NULL,
   heartbeat_at INTEGER NOT NULL
 );
@@ -370,6 +406,118 @@ export class AgentState {
   releaseLock(): void {
     this.db.query('DELETE FROM watcher_lock WHERE scope = ? AND pid = ?').run(this.scope, process.pid)
   }
+}
+
+/**
+ * The listener's own liveness, recorded WITHOUT an authenticated identity.
+ *
+ * `AgentState` is scoped by the user the credential turned out to be, so none
+ * of it can be written — or read — while the identity call is failing. That is
+ * precisely the window an operator needs an answer in: after a host reboot,
+ * four agents answered `health: live` from a fresh identity call while their
+ * watchers had been dead for hours. This table is the honest signal: a
+ * heartbeat written every few seconds by the supervisor that is actually
+ * resident, plus what it is doing and the last error it saw.
+ *
+ * It lives in the same SQLite file, keyed by connection id + origin, so
+ * `status` can read it before it knows who the credential is.
+ */
+export class WatcherHealth {
+  private readonly db: Database
+
+  private constructor(db: Database) {
+    this.db = db
+  }
+
+  static open(stateDir: string): WatcherHealth {
+    mkdirSync(stateDir, { recursive: true })
+    const db = new Database(join(stateDir, 'agent.sqlite'), { create: true })
+    db.exec('PRAGMA journal_mode = WAL')
+    db.exec('PRAGMA busy_timeout = 5000')
+    db.exec(SCHEMA)
+    return new WatcherHealth(db)
+  }
+
+  close(): void {
+    this.db.close(false)
+  }
+
+  /**
+   * Record where one connection stands. `error` is remembered across beats: a
+   * listener that recovered still shows what it was last stopped by, which is
+   * what makes a flapping server visible at all.
+   *
+   * A row belongs to the process that is actually listening. A second `watch`
+   * — which will lose the lock a moment later — must not stamp its own pid
+   * over a live watcher's, or `status` would report a working listener as
+   * dead. Ownership is released exactly as the lock's is: a stopped holder, a
+   * heartbeat past LOCK_STALE_MS, or a same-host pid that is gone.
+   */
+  report(args: {
+    connectionId: string
+    origin: string
+    reported: WatcherHealthRow['reported']
+    attempts?: number
+    error?: { text: string; kind: string } | null
+    now?: number
+  }): void {
+    const now = args.now ?? Date.now()
+    const key = `${args.connectionId}|${args.origin}`
+    const error = args.error
+    const held = this.read(args.connectionId, args.origin)
+    if (held && (held.pid !== process.pid || held.host !== hostname()) && liveHolder(held, now)) return
+    this.db
+      .query(
+        `INSERT INTO watcher_health (key, connection_id, origin, pid, host, reported, attempts,
+                                     last_error, last_error_kind, last_error_at, started_at, heartbeat_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (key) DO UPDATE SET pid = excluded.pid, host = excluded.host,
+           reported = excluded.reported, attempts = excluded.attempts,
+           last_error = COALESCE(excluded.last_error, watcher_health.last_error),
+           last_error_kind = COALESCE(excluded.last_error_kind, watcher_health.last_error_kind),
+           last_error_at = COALESCE(excluded.last_error_at, watcher_health.last_error_at),
+           started_at = CASE WHEN watcher_health.pid = excluded.pid AND watcher_health.host = excluded.host
+                             THEN watcher_health.started_at ELSE excluded.started_at END,
+           heartbeat_at = excluded.heartbeat_at`,
+      )
+      .run(
+        key,
+        args.connectionId,
+        args.origin,
+        process.pid,
+        hostname(),
+        args.reported,
+        args.attempts ?? 0,
+        error ? error.text.slice(0, 500) : null,
+        error ? error.kind : null,
+        error ? now : null,
+        now,
+        now,
+      )
+  }
+
+  read(connectionId: string, origin: string): WatcherHealthRow | undefined {
+    return (
+      this.db
+        .query<WatcherHealthRow, [string]>(
+          `SELECT connection_id, origin, pid, host, reported, attempts, last_error, last_error_kind,
+                  last_error_at, started_at, heartbeat_at FROM watcher_health WHERE key = ?`,
+        )
+        .get(`${connectionId}|${origin}`) ?? undefined
+    )
+  }
+}
+
+/**
+ * Is the process that wrote this row still the listener? Same test the lock
+ * uses: a stopped holder is not, a heartbeat past LOCK_STALE_MS is not, and on
+ * this host a pid that is gone is not — immediately, so a crash never leaves a
+ * phantom listener behind.
+ */
+function liveHolder(row: WatcherHealthRow, now: number): boolean {
+  if (row.reported === 'stopped') return false
+  if (row.heartbeat_at <= now - LOCK_STALE_MS) return false
+  return !(row.host === hostname() && !processAlive(row.pid))
 }
 
 export function processAlive(pid: number): boolean {

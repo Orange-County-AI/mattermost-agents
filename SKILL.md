@@ -219,7 +219,18 @@ set up in this session". With a wrong one it fails loudly on stderr:
   process is receiving the messages. Do not start a second one.
 - `mattermost-agent: auth-error: …` / `identity-error: …` — the token is
   missing, wrong, revoked, or belongs to a different account than the config
-  pins.
+  pins. A human has to fix it; the listener stops.
+- `mattermost-agent: transient-error: … DEGRADED (attempt N)` — the server or
+  the network, not your token: a 502 from a proxy, a 5xx, a throttle, a
+  timeout. The listener stays up and keeps retrying, so this heals on its own
+  and needs no restart.
+
+`status` answers two different questions, and they can disagree. `health` is
+whether the credential works right now; `watcher.state` is whether anything is
+actually listening — `listening`, `retrying`, `stopped`, `stale` or `absent`,
+with `heartbeat_age_ms`. If `health` is `live` but `watcher.state` is not
+`listening`, nobody is receiving your messages: say so plainly and ask for the
+listener to be restarted.
 
 Two honest limits worth knowing. A first run only looks back one hour, so
 anything older is not your backlog. And if a catch-up window hits the server's

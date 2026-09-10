@@ -6,7 +6,7 @@
  * channel outside the configured allowlist (static mode) or outside this
  * account's real memberships (membership mode) is refused, whoever asks.
  */
-import { MattermostClient, type MMListPost } from '../mattermost'
+import { MattermostClient, httpStatus, type MMListPost } from '../mattermost'
 import { connectionById, resolveToken, type AgentConfig, type ConnectionConfig } from './config'
 import { channelScope, type ChannelScope } from './scope'
 import { AgentState, type StoredEvent } from './state'
@@ -15,6 +15,28 @@ export class BackendError extends Error {}
 
 /** The credential does not belong to the identity the config pins it to. */
 export class IdentityError extends Error {}
+
+/**
+ * Why a connection failed to open, and therefore whether stopping is ever the
+ * right answer.
+ *
+ * `identity` is a DEFINITE refusal of the credential: the server judged it and
+ * said no (401, 403), or it authenticated as somebody the profile is not
+ * pinned to. A human has to fix that, so the listener may stop.
+ *
+ * `transient` is everything else — 5xx, 408, 429, a connection reset, a DNS or
+ * TLS failure, a timeout, a proxy's HTML error page. The credential was never
+ * judged, so the only correct response is to back off and keep trying: a
+ * server that is rebooting must not turn into an hours-long silence. This is
+ * the exact misclassification that made watchers exit 4 on a boot-time 502.
+ */
+export type OpenFailureKind = 'identity' | 'transient'
+
+export function openFailureKind(err: unknown): OpenFailureKind {
+  if (err instanceof IdentityError) return 'identity'
+  const status = httpStatus(err)
+  return status === 401 || status === 403 ? 'identity' : 'transient'
+}
 
 export interface Session {
   conn: ConnectionConfig

@@ -89,6 +89,22 @@ export interface MMFileInfo {
 /** Every request carries a deadline: an unresponsive server must not hang a sweep or a startup forever. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 
+/**
+ * A response the server actually answered with. It carries the status, so a
+ * caller can tell a definite refusal of the credential (401/403) from a
+ * server-side or gateway failure (5xx, 408, 429) without parsing text — the
+ * distinction the whole retry policy rests on. The message shape is unchanged,
+ * so logs and stored outbound errors read exactly as before.
+ */
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
 export class MattermostClient {
   readonly baseUrl: string
   private readonly token: string
@@ -117,7 +133,7 @@ export class MattermostClient {
     })
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      throw new Error(`MM ${init?.method ?? 'GET'} ${path}: HTTP ${res.status} ${body.slice(0, 300)}`)
+      throw new HttpError(res.status, `MM ${init?.method ?? 'GET'} ${path}: HTTP ${res.status} ${body.slice(0, 300)}`)
     }
     return (await res.json()) as T
   }
@@ -293,7 +309,7 @@ export class MattermostClient {
       headers: { Authorization: `Bearer ${this.token}` },
     })
     if (!res.ok) {
-      throw new Error(`MM GET /files/${fileId}: HTTP ${res.status}`)
+      throw new HttpError(res.status, `MM GET /files/${fileId}: HTTP ${res.status}`)
     }
     return res.arrayBuffer()
   }
@@ -301,11 +317,13 @@ export class MattermostClient {
 
 /**
  * The HTTP status inside an error thrown by this client, when it carries one.
- * Every failed call formats `… HTTP <status> <body>`, so callers can tell a
- * refusal (403) from an absence (404) from an ambiguous 5xx without parsing
- * message text themselves.
+ * Failures from `api()` are `HttpError`s and answer from the status itself; a
+ * transport failure — DNS, a reset, TLS, a timeout — carries no status, which
+ * is itself the answer: the server never judged the request. The text fallback
+ * keeps errors that only ever existed as a formatted message readable.
  */
 export function httpStatus(err: unknown): number | undefined {
+  if (err instanceof HttpError) return err.status
   const match = /HTTP (\d{3})/.exec(err instanceof Error ? err.message : String(err))
   return match ? Number(match[1]) : undefined
 }

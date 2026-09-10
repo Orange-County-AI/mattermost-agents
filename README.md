@@ -309,7 +309,9 @@ dm             (--username NAME | --user-id ID) --message TEXT --request-id ID
 command prints one JSON value on stdout. During `watch`, stdout carries **only**
 message events, one JSON object per line; everything else goes to stderr
 prefixed `mattermost-agent:`. Exit codes: `0` clean, `1` unexpected, `2` config
-missing/invalid, `3` another watcher holds the lock, `4` auth/identity failure.
+missing/invalid, `3` another watcher holds the lock, `4` auth/identity failure —
+and `4` means a credential a human must fix (a 401, a 403, or the wrong
+identity), never a server that was merely unreachable.
 
 ## Operator onboarding
 
@@ -517,6 +519,25 @@ each other's events.
   gap, logs that catch-up is DEGRADED, and `status` reports the gap. Those
   messages are **not** delivered until an operator replays that range from
   channel history.
+- **A transient failure never stops the listener.** Only a DEFINITE refusal of
+  the credential — HTTP 401, HTTP 403, or a token that authenticates as
+  somebody other than `expectedUserId` — is an identity failure, and only that
+  exits `4`. A 5xx, a 408, a 429, a proxy's HTML error page, a reset, a DNS or
+  TLS failure, a timeout: the credential was never judged, so the connection
+  is logged as `transient-error … DEGRADED`, backed off (1s doubling to a
+  minute) and retried forever, with no attempt cap. The process stays resident
+  even when nothing has opened yet, because a server that reboots behind a
+  proxy 502s for a while and a listener that stops listening is the failure
+  this prevents.
+- **`status` reports the listener's own liveness, not just the credential's.**
+  `health` comes from a live identity call; `watcher` comes from the heartbeat
+  the resident supervisor writes into the state file, keyed by connection +
+  origin so it answers even while the identity call is failing. `state` is
+  `listening`, `retrying`, `stopped`, `stale` (it claimed to be running and its
+  heartbeat died — nothing is listening) or `absent`, alongside
+  `heartbeat_age_ms` and the last error it rode out. A `health: live` row whose
+  `watcher.state` is not `listening` is an agent that is deaf, which is exactly
+  what a fresh identity call alone cannot tell you.
 - **Event identity is post id + content revision** (`edit_at`, else
   `create_at`): an edit is a new event, while a reaction or a threaded reply is
   not.
@@ -533,7 +554,7 @@ each other's events.
   (`bun run skill:sync`), and a test fails if the two ever diverge.
 - `src/mattermost.ts` — the only holder of the token; every authed HTTP call.
 - `src/agent/config.ts` — profiles: which server, which identity, what scope.
-- `src/agent/state.ts` — SQLite: events, checkpoints, gaps, outbound claims, watcher lock.
+- `src/agent/state.ts` — SQLite: events, checkpoints, gaps, outbound claims, watcher lock, watcher health.
 - `src/agent/ingest.ts` — posts → events (edits, tombstones, self, peer bots, overflow).
 - `src/agent/scope.ts` — static allowlist vs live memberships.
 - `src/agent/watcher.ts` — the resident listener.
