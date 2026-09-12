@@ -55,6 +55,8 @@ import {
 	CHANNEL_LABEL,
 	DEFAULT_STATUS,
 	labelChoice,
+	ListenerStateReader,
+	markerFor,
 	parseStatusConfig,
 	readProfileFacts,
 	renderSegmentBody,
@@ -1409,6 +1411,55 @@ async function footerFieldsAreConfigurable(): Promise<void> {
 }
 
 /**
+ * The reader outlives the table it reads. On a restart this extension opens
+ * its read-only handle first and the listener creates `watcher_identity`
+ * seconds later; a build that cached "no such table" at open time never showed
+ * a name again on those boxes, while a box whose handle happened to open
+ * second showed them fine. So a MISSING table is provisional and re-probed,
+ * and a present one settles the question for good.
+ */
+async function footerPicksUpATableCreatedAfterTheHandle(): Promise<void> {
+	console.log("footer: a state file that grows the identity table under a live reader still names the account");
+	const { stateDir, origin } = footerWorkspace("late-table", ["ocai"]);
+	recordListener(stateDir, origin, { connection: "ocai", reported: "listening" });
+	// An older fleet's state file: health and lock, no identity table. This is
+	// also exactly what the file looks like for the seconds between an
+	// extension opening it and the upgraded listener creating its tables.
+	const older = new Database(join(stateDir, "agent.sqlite"));
+	older.exec("DROP TABLE IF EXISTS watcher_identity");
+	older.close(false);
+
+	const notes: string[] = [];
+	const reader = new ListenerStateReader(stateDir, (line) => notes.push(line));
+	const config = parseStatusConfig(undefined);
+	/** One refresh's worth of segment, from whatever the reader can see now. */
+	const render = (): string =>
+		renderSegmentBody(
+			[
+				{
+					connection: "ocai",
+					account: reader.read(false).identities.get("ocai")?.account ?? "",
+					marker: markerFor("running", reader.read(false).rows.get("ocai"), Date.now()),
+					elsewhere: null,
+					pending: 0,
+				},
+			],
+			config,
+		);
+
+	check("without the table the segment is the connection alone", render() === "ocai", render());
+	check("and nothing is logged as an error for it", notes.length === 0, notes.join(" | "));
+
+	// The listener starts and creates its tables — with the reader's handle
+	// already open, which is the whole point.
+	recordIdentity(stateDir, origin, "ocai", "fleet");
+
+	check("the name appears without reopening the reader", render() === "ocai/fleet", render());
+	check("still nothing logged", notes.length === 0, notes.join(" | "));
+	reader.close();
+}
+
+/**
  * The failure that hid an evening's worth of deafness: another session's
  * listener holds the lock, so this one receives nothing, while the health rows
  * that listener writes into the shared state file say `listening` for
@@ -1571,6 +1622,7 @@ for (const scenario of [
 	footerIsOneHonestLine,
 	footerLabelIsTheBrandGlyph,
 	footerFieldsAreConfigurable,
+	footerPicksUpATableCreatedAfterTheHandle,
 	footerMarksALockHeldElsewhere,
 	footerConfigIsRefusedLoudly,
 ]) {

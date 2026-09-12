@@ -297,6 +297,14 @@ const PENDING_SQL = "SELECT connection, COUNT(*) AS pending FROM events WHERE ac
 const IDENTITY_SQL = "SELECT connection_id, scope, user_id, username, resolved_at FROM watcher_identity";
 const LOCK_SQL = "SELECT scope, pid, host, heartbeat_at FROM watcher_lock";
 
+/**
+ * Tables a state file may not have yet: added after fleets were deployed, and
+ * created by the LISTENER when it opens the file — which can be well after
+ * this read-only handle exists. Everything else here has been written by every
+ * build that ever created an `agent.sqlite`.
+ */
+const OPTIONAL_TABLES = ["watcher_identity"] as const;
+
 interface HealthQueryRow {
 	connection_id: string;
 	reported: string;
@@ -338,8 +346,10 @@ export class ListenerStateReader {
 	readonly #note: (line: string) => void;
 	#db: Database | null = null;
 	#complained = false;
-	/** Which tables this file actually has, read once per open. */
+	/** Which tables this file has, as of the last probe. */
 	#tables: Record<string, true> = {};
+	/** True once every optional table is present: nothing left to wait for. */
+	#settled = false;
 
 	constructor(stateDir: string, note: (line: string) => void) {
 		this.#path = join(stateDir, "agent.sqlite");
@@ -354,6 +364,7 @@ export class ListenerStateReader {
 	read(withPending: boolean): ListenerFacts {
 		const db = this.#open();
 		if (!db) return NOTHING_KNOWN;
+		if (!this.#settled) this.#probe(db);
 		try {
 			const rows = new Map<string, ListenerRow>();
 			for (const row of db.query<HealthQueryRow, []>(HEALTH_SQL).all()) {
@@ -406,19 +417,34 @@ export class ListenerStateReader {
 		this.#db?.close(false);
 		this.#db = null;
 		this.#tables = {};
+		this.#settled = false;
+	}
+
+	/**
+	 * Which tables this file has. A MISSING table is provisional, never cached:
+	 * this handle is opened read-only and long-lived, and the listener creates
+	 * its tables when IT opens the file — which, after a restart, is seconds
+	 * after this handle already exists. Caching the absence once made the names
+	 * never appear on a box whose extension happened to open first. So the
+	 * probe repeats, one indexed catalogue read per refresh, until every
+	 * optional table is there, and then stops for good.
+	 */
+	#probe(db: Database): void {
+		try {
+			for (const row of db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all()) {
+				this.#tables[row.name] = true;
+			}
+			this.#settled = OPTIONAL_TABLES.every((table) => this.#tables[table] === true);
+		} catch {
+			// A catalogue this read cannot take is a reason to skip the optional
+			// queries this refresh, not to blank the segment.
+		}
 	}
 
 	#open(): Database | null {
 		if (this.#db) return this.#db;
 		try {
-			const db = new Database(this.#path, { readonly: true });
-			// One catalogue read per open, so a table this build queries and an
-			// older writer never created is a missing fact rather than a thrown
-			// read that would blank the whole segment.
-			for (const row of db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all()) {
-				this.#tables[row.name] = true;
-			}
-			this.#db = db;
+			this.#db = new Database(this.#path, { readonly: true });
 			this.#complained = false;
 			return this.#db;
 		} catch (error) {
