@@ -1,15 +1,19 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgentState, LOCK_STALE_MS, type EventInput } from './state'
 
-function openState(overrides: { connectionId?: string; origin?: string; userId?: string; stateDir?: string } = {}): AgentState {
+function openState(
+  overrides: { connectionId?: string; origin?: string; userId?: string; username?: string; stateDir?: string } = {},
+): AgentState {
   return AgentState.open({
     stateDir: overrides.stateDir ?? mkdtempSync(join(tmpdir(), 'agent-state-')),
     connectionId: overrides.connectionId ?? 'ocai',
     origin: overrides.origin ?? 'https://mm.example',
     userId: overrides.userId ?? 'bot-1',
+    username: overrides.username ?? 'bot-one',
   })
 }
 
@@ -28,6 +32,59 @@ function event(id: string, overrides: Partial<EventInput> = {}): EventInput {
     ...overrides,
   }
 }
+
+describe('the identity a credential resolved to', () => {
+  /**
+   * Read exactly the way the OMP footer reads it: another process, opening
+   * this file read-only and asking the table who this connection acts as.
+   */
+  function identityRows(stateDir: string): { connection_id: string; scope: string; user_id: string; username: string }[] {
+    const db = new Database(join(stateDir, 'agent.sqlite'), { readonly: true })
+    try {
+      return db
+        .query<{ connection_id: string; scope: string; user_id: string; username: string }, []>(
+          'SELECT connection_id, scope, user_id, username FROM watcher_identity ORDER BY connection_id',
+        )
+        .all()
+    } finally {
+      db.close(false)
+    }
+  }
+
+  test('opening state records the account that authenticated, keyed so it is readable without it', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'agent-identity-'))
+    const state = openState({ stateDir, userId: 'iucc8d7i8brdfq8cpsmtenfuma', username: 'stub' })
+    expect(identityRows(stateDir)).toEqual([
+      {
+        connection_id: 'ocai',
+        scope: 'ocai|https://mm.example|iucc8d7i8brdfq8cpsmtenfuma',
+        user_id: 'iucc8d7i8brdfq8cpsmtenfuma',
+        username: 'stub',
+      },
+    ])
+    // The scope on the row is the lock's own key, so a reader can join the two
+    // without re-deriving anything.
+    expect(identityRows(stateDir)[0]?.scope).toBe(state.scope)
+  })
+
+  test('a renamed account is corrected on the next authentication, not duplicated', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'agent-identity-'))
+    openState({ stateDir, userId: 'user-1', username: 'fleet' }).close()
+    openState({ stateDir, userId: 'user-1', username: 'fleet-titan' }).close()
+    expect(identityRows(stateDir)).toHaveLength(1)
+    expect(identityRows(stateDir)[0]?.username).toBe('fleet-titan')
+  })
+
+  test('two connections in one stateDir each keep their own account', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'agent-identity-'))
+    openState({ stateDir, connectionId: 'ocai', userId: 'user-1', username: 'stub' }).close()
+    openState({ stateDir, connectionId: 'ticket500', userId: 'user-2', username: 'stub-ts' }).close()
+    expect(identityRows(stateDir).map((row) => `${row.connection_id}/${row.username}`)).toEqual([
+      'ocai/stub',
+      'ticket500/stub-ts',
+    ])
+  })
+})
 
 describe('checkpoints and events', () => {
   test('re-sweeping the same window stores nothing new and leaves the event unsettled', () => {

@@ -25,6 +25,7 @@
  * core suite.
  */
 
+import { Database } from "bun:sqlite";
 import { spawn, spawnSync } from "node:child_process";
 import {
 	existsSync,
@@ -37,7 +38,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentState, WatcherHealth } from "../../src/agent/state.ts";
@@ -1082,9 +1083,37 @@ function recordListener(
 	health.close();
 }
 
+/**
+ * What a successful authentication records about WHO this connection acts as.
+ * Core writes it from `openSession`; here it is written the same way, through
+ * `AgentState.open`, so the footer reads a row no test hand-crafted.
+ */
+function recordIdentity(stateDir: string, origin: string, connection: string, username: string): string {
+	const state = AgentState.open({ stateDir, connectionId: connection, origin, userId: `user-${username}`, username });
+	const scope = state.scope;
+	state.close();
+	return scope;
+}
+
+/**
+ * A watcher lock held by SOMEBODY ELSE — another session's listener, which is
+ * what makes this session deaf while every health row still reads `listening`.
+ * Written directly, because the only API for this table takes the lock for the
+ * calling process and the whole point is a pid that is not ours.
+ */
+function recordForeignLock(stateDir: string, scope: string, pid: number, host: string, ageMs = 0): void {
+	const db = new Database(join(stateDir, "agent.sqlite"), { create: true });
+	db.query(
+		`INSERT INTO watcher_lock (scope, pid, host, started_at, heartbeat_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT (scope) DO UPDATE SET pid = excluded.pid, host = excluded.host,
+		   started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at`,
+	).run(scope, pid, host, Date.now() - ageMs, Date.now() - ageMs);
+	db.close(false);
+}
+
 /** Unacked events, stored the way a sweep stores them. */
-function recordPending(stateDir: string, origin: string, connection: string, count: number): void {
-	const state = AgentState.open({ stateDir, connectionId: connection, origin, userId: "user1" });
+function recordPending(stateDir: string, origin: string, connection: string, username: string, count: number): void {
+	const state = AgentState.open({ stateDir, connectionId: connection, origin, userId: `user-${username}`, username });
 	const now = Date.now();
 	state.commitSweep({
 		channelId: "channel1",
@@ -1168,8 +1197,10 @@ async function footerIsOneHonestLine(): Promise<void> {
 	// A heartbeat this old is what a dead listener looks like, whatever the
 	// credential says. This is the case that went unnoticed for eight hours.
 	recordListener(stateDir, origin, { connection: "ticket500", reported: "listening", ageMs: 60_000 });
-	// `norm` gets no row at all: nothing has ever listened for it.
-	recordPending(stateDir, origin, "ocai", 2);
+	// `norm` gets no row at all: nothing has ever listened for it — and no
+	// identity either, so it is the connection that cannot be named.
+	recordIdentity(stateDir, origin, "ticket500", "stub");
+	recordPending(stateDir, origin, "ocai", "stub", 2);
 
 	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
 	process.env.MATTERMOST_AGENT_CONFIG = config;
@@ -1190,21 +1221,29 @@ async function footerIsOneHonestLine(): Promise<void> {
 
 	check("one status key, so one rendered line", host.keys().length === 1, host.keys().join(","));
 	check("that key is the shared one", host.keys()[0] === CHANNEL_STATUS_KEY, String(host.keys()[0]));
+	// The realistic line: two named identities, one of them dead, one
+	// connection nothing has ever authenticated for, and a mailbox beside them.
 	check(
 		"both segments on that line, each behind its own brand glyph, chat before mail",
-		host.line() === `${CHANNEL_LABEL.glyph} ocai·ticket500!stale·norm!absent │ ${MAIL_LABEL.glyph} stub@example.test`,
+		host.line() ===
+			`${CHANNEL_LABEL.glyph} ocai/stub·ticket500/stub!stale·norm!absent │ ${MAIL_LABEL.glyph} stub@example.test`,
+		String(host.line()),
+	);
+	check(
+		"a connection local state cannot name is still named by its connection id",
+		(host.line() ?? "").includes("norm!absent") && !(host.line() ?? "").includes("norm/"),
 		String(host.line()),
 	);
 	check(
 		"the default names identities and counts nothing",
-		!/\d/.test((host.line() ?? "").replace("stub@example.test", "").replace("ticket500", "")),
+		!/\d/.test((host.line() ?? "").replace("stub@example.test", "").replace(/ticket500/g, "")),
 		String(host.line()),
 	);
 
 	mail.clear();
 	check(
 		"with only one integration the line is that segment alone",
-		host.line() === `${CHANNEL_LABEL.glyph} ocai·ticket500!stale·norm!absent`,
+		host.line() === `${CHANNEL_LABEL.glyph} ocai/stub·ticket500/stub!stale·norm!absent`,
 		String(host.line()),
 	);
 
@@ -1235,12 +1274,12 @@ async function footerLabelIsTheBrandGlyph(): Promise<void> {
 		host.context().ui.setStatus(key, text),
 	);
 	const healthy: SegmentEntry[] = [
-		{ identity: "ocai", marker: null, pending: 0 },
-		{ identity: "ticket500", marker: null, pending: 0 },
+		{ connection: "ocai", account: "stub", marker: null, elsewhere: null, pending: 0 },
+		{ connection: "ticket500", account: "stub", marker: null, elsewhere: null, pending: 0 },
 	];
 	const stale: SegmentEntry[] = [
-		{ identity: "ocai", marker: null, pending: 0 },
-		{ identity: "ticket500", marker: "stale", pending: 0 },
+		{ connection: "ocai", account: "stub", marker: null, elsewhere: null, pending: 0 },
+		{ connection: "ticket500", account: "stub", marker: "stale", elsewhere: null, pending: 0 },
 	];
 	/** Exactly what the adapter does per refresh: parse the block, render, compose. */
 	const render = (entries: SegmentEntry[], block: unknown): string | undefined => {
@@ -1252,29 +1291,29 @@ async function footerLabelIsTheBrandGlyph(): Promise<void> {
 	const ownGlyph = "\u{f0361}";
 
 	check(
-		"the default segment is the glyph, one space, the identities",
-		render(healthy, undefined) === `${CHANNEL_LABEL.glyph} ocai·ticket500`,
+		"the default segment is the glyph, one space, the connection and the account on it",
+		render(healthy, undefined) === `${CHANNEL_LABEL.glyph} ocai/stub·ticket500/stub`,
 		String(render(healthy, undefined)),
 	);
 	check(
 		'label "text" is the short word',
-		render(healthy, { label: "text" }) === "mm ocai·ticket500",
+		render(healthy, { label: "text" }) === "mm ocai/stub·ticket500/stub",
 		String(render(healthy, { label: "text" })),
 	);
 	check(
 		'label "text" is spelled out on a verbose line',
-		render(healthy, { label: "text", style: "verbose" }) === "mattermost ocai, ticket500",
+		render(healthy, { label: "text", style: "verbose" }) === "mattermost ocai/stub, ticket500/stub",
 		String(render(healthy, { label: "text", style: "verbose" })),
 	);
 	check(
 		'label "none" is no label at all',
-		render(healthy, { label: "none" }) === "ocai·ticket500",
+		render(healthy, { label: "none" }) === "ocai/stub·ticket500/stub",
 		String(render(healthy, { label: "none" })),
 	);
 	check(
 		"a field list without the label drops it, whatever the style asks for",
-		render(healthy, { fields: ["identity"], label: "glyph" }) === "ocai·ticket500",
-		String(render(healthy, { fields: ["identity"], label: "glyph" })),
+		render(healthy, { fields: ["connection", "user"], label: "glyph" }) === "ocai/stub·ticket500/stub",
+		String(render(healthy, { fields: ["connection", "user"], label: "glyph" })),
 	);
 	check(
 		"a label with no other field is still a segment",
@@ -1283,7 +1322,7 @@ async function footerLabelIsTheBrandGlyph(): Promise<void> {
 	);
 	check(
 		"the operator's own glyph replaces this build's, no release needed",
-		render(healthy, { glyph: ownGlyph }) === `${ownGlyph} ocai·ticket500`,
+		render(healthy, { glyph: ownGlyph }) === `${ownGlyph} ocai/stub·ticket500/stub`,
 		String(render(healthy, { glyph: ownGlyph })),
 	);
 
@@ -1291,7 +1330,7 @@ async function footerLabelIsTheBrandGlyph(): Promise<void> {
 	// listener that stopped listening is still named.
 	for (const style of LABEL_STYLES) {
 		const line = render(stale, { label: style }) ?? "";
-		check(`a dead listener is still marked under label "${style}"`, line.includes("ticket500!stale"), line);
+		check(`a dead listener is still marked under label "${style}"`, line.includes("ticket500/stub!stale"), line);
 	}
 
 	probe.clear();
@@ -1299,21 +1338,50 @@ async function footerLabelIsTheBrandGlyph(): Promise<void> {
 }
 
 async function footerFieldsAreConfigurable(): Promise<void> {
-	console.log("footer: the operator picks the fields, and cannot switch off a marker");
-	const chosen = footerWorkspace("fields", ["ocai", "ticket500"], { fields: ["identity"], style: "compact" });
-	recordListener(chosen.stateDir, chosen.origin, { connection: "ocai", reported: "listening" });
-	recordListener(chosen.stateDir, chosen.origin, { connection: "ticket500", reported: "listening" });
-
+	console.log("footer: the operator picks connection, user or both, and cannot switch off a marker");
 	process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
-	process.env.MATTERMOST_AGENT_CONFIG = chosen.config;
 	process.env.FAKE_CORE_EVENTS = "0";
 
-	const identityHost = footerHost("footer-fields", chosen.dir);
-	const identityOnly = adapterUnderTest();
-	await identityOnly.handlers.get("session_start")?.({}, identityHost.context());
-	await waitFor("the configured line", () => identityHost.line() === "ocai·ticket500");
-	check("exactly the configured fields, in the segment's order", identityHost.line() === "ocai·ticket500", String(identityHost.line()));
-	await identityOnly.handlers.get("session_shutdown")?.({}, identityHost.context());
+	// The two halves, separately: `ocai` and `ticket500` are two connections of
+	// one profile, and this session acts as `stub` on both — which is exactly
+	// the case a connection-only line cannot tell apart from anybody else's.
+	const halves: [string, unknown, string][] = [
+		["both halves by default", undefined, "ocai/stub·ticket500/stub"],
+		["connection only", { fields: ["connection"] }, "ocai·ticket500"],
+		["user only", { fields: ["user"] }, "stub·stub"],
+	];
+	for (const [label, block, expected] of halves) {
+		const workspace = footerWorkspace(`half-${label.replace(/\W+/g, "-")}`, ["ocai", "ticket500"], block);
+		for (const connection of ["ocai", "ticket500"]) {
+			recordListener(workspace.stateDir, workspace.origin, { connection, reported: "listening" });
+			recordIdentity(workspace.stateDir, workspace.origin, connection, "stub");
+		}
+		process.env.MATTERMOST_AGENT_CONFIG = workspace.config;
+		const host = footerHost(`footer-${label}`, workspace.dir);
+		const instance = adapterUnderTest();
+		await instance.handlers.get("session_start")?.({}, host.context());
+		const labelled = block === undefined ? `${CHANNEL_LABEL.glyph} ${expected}` : expected;
+		await waitFor(`the ${label} line`, () => host.line() === labelled);
+		check(`${label}: exactly what the field list asked for`, host.line() === labelled, String(host.line()));
+		await instance.handlers.get("session_shutdown")?.({}, host.context());
+	}
+
+	// A `user`-only line for a connection nothing has authenticated for: the
+	// account is unknown, and the connection id is what is left to say. The
+	// alternative is a segment that names nothing at all.
+	const nameless = footerWorkspace("nameless", ["ocai"], { fields: ["user"] });
+	recordListener(nameless.stateDir, nameless.origin, { connection: "ocai", reported: "listening" });
+	process.env.MATTERMOST_AGENT_CONFIG = nameless.config;
+	const namelessHost = footerHost("footer-nameless", nameless.dir);
+	const namelessRun = adapterUnderTest();
+	await namelessRun.handlers.get("session_start")?.({}, namelessHost.context());
+	await waitFor("the degraded line", () => namelessHost.line() === "ocai");
+	check(
+		"an identity local state cannot name degrades to the connection, never to nothing",
+		namelessHost.line() === "ocai",
+		String(namelessHost.line()),
+	);
+	await namelessRun.handlers.get("session_shutdown")?.({}, namelessHost.context());
 
 	// Label and identity switched off, and a refused credential on one
 	// connection: the marker names it anyway, because that is the one thing
@@ -1325,7 +1393,7 @@ async function footerFieldsAreConfigurable(): Promise<void> {
 		reported: "retrying",
 		error: { text: "401 from the server", kind: "identity" },
 	});
-	recordPending(trimmed.stateDir, trimmed.origin, "ocai", 2);
+	recordPending(trimmed.stateDir, trimmed.origin, "ocai", "stub", 2);
 	process.env.MATTERMOST_AGENT_CONFIG = trimmed.config;
 
 	const trimmedHost = footerHost("footer-trimmed", trimmed.dir);
@@ -1340,12 +1408,105 @@ async function footerFieldsAreConfigurable(): Promise<void> {
 	await countOnly.handlers.get("session_shutdown")?.({}, trimmedHost.context());
 }
 
+/**
+ * The failure that hid an evening's worth of deafness: another session's
+ * listener holds the lock, so this one receives nothing, while the health rows
+ * that listener writes into the shared state file say `listening` for
+ * everybody. Nothing short of the lock's own pid can tell the two apart.
+ */
+async function footerMarksALockHeldElsewhere(): Promise<void> {
+	console.log("footer: a watcher lock held by another session is marked, whatever the fields say");
+	// A real live process that is nobody's child in this session's tree. `sleep`
+	// is the cheapest one that stays up for the length of the check.
+	const stranger = spawn("sleep", ["60"], { stdio: "ignore" });
+	const strangerPid = stranger.pid;
+	if (strangerPid === undefined) {
+		check("a foreign lock holder could be spawned", false, "sleep did not start");
+		return;
+	}
+	try {
+		process.env.MATTERMOST_AGENT_CLI = FAKE_CORE;
+		process.env.FAKE_CORE_EVENTS = "0";
+		const marked = `ocai/fleet!elsewhere#${strangerPid}`;
+
+		// Healthy in every respect the old line could see: a fresh heartbeat, a
+		// listening report, an identity that authenticated — and a lock that
+		// belongs to somebody else, which is the only fact that says this
+		// session hears nothing.
+		const workspace = footerWorkspace("elsewhere", ["ocai"]);
+		recordListener(workspace.stateDir, workspace.origin, { connection: "ocai", reported: "listening" });
+		const scope = recordIdentity(workspace.stateDir, workspace.origin, "ocai", "fleet");
+		recordForeignLock(workspace.stateDir, scope, strangerPid, hostname());
+		process.env.MATTERMOST_AGENT_CONFIG = workspace.config;
+
+		const host = footerHost("footer-elsewhere", workspace.dir);
+		const instance = adapterUnderTest();
+		await instance.handlers.get("session_start")?.({}, host.context());
+		await waitFor("the elsewhere marker", () => (host.line() ?? "").includes("!elsewhere"));
+		check(
+			"a lock held by another live process names the identity and where the lock is",
+			host.line() === `${CHANNEL_LABEL.glyph} ${marked}`,
+			String(host.line()),
+		);
+		check(
+			"the listener still reports itself healthy, which is exactly why this marker exists",
+			!(host.line() ?? "").includes("!stale") && !(host.line() ?? "").includes("!absent"),
+			String(host.line()),
+		);
+		await instance.handlers.get("session_shutdown")?.({}, host.context());
+
+		// The same lock under a field list that asked for no name at all: the
+		// marker is not a field, and the name it drags onto the line is the
+		// whole one, because "somebody else is listening" is useless without
+		// "as whom".
+		const trimmed = footerWorkspace("elsewhere-trimmed", ["ocai"], { fields: ["label"] });
+		recordListener(trimmed.stateDir, trimmed.origin, { connection: "ocai", reported: "listening" });
+		const trimmedScope = recordIdentity(trimmed.stateDir, trimmed.origin, "ocai", "fleet");
+		recordForeignLock(trimmed.stateDir, trimmedScope, strangerPid, hostname());
+		process.env.MATTERMOST_AGENT_CONFIG = trimmed.config;
+
+		const trimmedHost = footerHost("footer-elsewhere-trimmed", trimmed.dir);
+		const trimmedRun = adapterUnderTest();
+		await trimmedRun.handlers.get("session_start")?.({}, trimmedHost.context());
+		await waitFor("the trimmed elsewhere marker", () => (trimmedHost.line() ?? "").includes("!elsewhere"));
+		check(
+			"no field list can switch the marker off, and it still says whose lock it is",
+			trimmedHost.line() === `${CHANNEL_LABEL.glyph} ${marked}`,
+			String(trimmedHost.line()),
+		);
+		await trimmedRun.handlers.get("session_shutdown")?.({}, trimmedHost.context());
+
+		// The same lock once its holder is gone: a dead pid holds nothing, and
+		// a marker that stayed would be the false alarm that teaches an
+		// operator to ignore this line.
+		stranger.kill("SIGKILL");
+		await new Promise<void>((resolve) => stranger.once("exit", () => resolve()));
+		process.env.MATTERMOST_AGENT_CONFIG = workspace.config;
+		const after = footerHost("footer-elsewhere-gone", workspace.dir);
+		const second = adapterUnderTest();
+		await second.handlers.get("session_start")?.({}, after.context());
+		await waitFor("the line without the marker", () => after.line() === `${CHANNEL_LABEL.glyph} ocai/fleet`);
+		check(
+			"a dead lock holder is not elsewhere, it is nowhere",
+			after.line() === `${CHANNEL_LABEL.glyph} ocai/fleet`,
+			String(after.line()),
+		);
+		await second.handlers.get("session_shutdown")?.({}, after.context());
+	} finally {
+		stranger.kill("SIGKILL");
+	}
+}
+
 async function footerConfigIsRefusedLoudly(): Promise<void> {
 	console.log("footer: a status block this build does not understand is refused, out loud");
 	const refusals: [string, unknown][] = [
 		["not an object", "compact"],
 		["an unknown key", { fields: ["label"], colour: "red" }],
 		["an unknown field", { fields: ["label", "mailbox"] }],
+		// The field that existed before the identity was split in two. A
+		// profile still asking for it is refused by name rather than quietly
+		// rendering something else.
+		["the retired \u201Cidentity\u201D field", { fields: ["label", "identity"] }],
 		["a field twice", { fields: ["label", "label"] }],
 		["an unknown style", { style: "tiny" }],
 		["an unknown label style", { label: "emoji" }],
@@ -1410,6 +1571,7 @@ for (const scenario of [
 	footerIsOneHonestLine,
 	footerLabelIsTheBrandGlyph,
 	footerFieldsAreConfigurable,
+	footerMarksALockHeldElsewhere,
 	footerConfigIsRefusedLoudly,
 ]) {
 	await scenario();

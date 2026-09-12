@@ -32,8 +32,10 @@ import {
 	CHANNEL_LABEL,
 	type ChildState,
 	DEFAULT_STATUS,
+	elsewhereLocator,
 	labelChoice,
 	ListenerStateReader,
+	lockFor,
 	markerFor,
 	type ProfileFacts,
 	readProfileFacts,
@@ -285,15 +287,60 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		const config = profile?.status ?? DEFAULT_STATUS;
 		const facts = profile && reader ? reader.read(config.fields.includes("count")) : null;
 		const now = Date.now();
+		// The listener this session spawned. Anything else holding the lock is
+		// another session's, and this session receives nothing from it.
+		const ownPid = watcher?.pid ?? null;
+		const ours = ownPid === null ? [] : [ownPid];
 		const entries: SegmentEntry[] = profile
-			? profile.connections.map((connection) => ({
-					identity: connection.identity,
-					marker: markerFor(child, facts?.rows.get(connection.id), now),
-					pending: facts?.pending.get(connection.id) ?? 0,
-				}))
+			? profile.connections.map((connection) => {
+					const identity = facts?.identities.get(connection.id);
+					return {
+						connection: connection.id,
+						// What a credential proved, when there is one; the
+						// profile's own claim otherwise, which for Mattermost is
+						// nothing at all until a listener has authenticated.
+						account: identity?.account ?? connection.account,
+						marker: markerFor(child, facts?.rows.get(connection.id), now),
+						elsewhere: elsewhereLocator(
+							lockFor(facts?.locks ?? [], connection.id, identity?.scope ?? null),
+							ours,
+							now,
+						),
+						pending: facts?.pending.get(connection.id) ?? 0,
+					};
+				})
 			: // No profile to name an identity from — the marker still speaks.
-				[{ identity: "", marker: markerFor(child, undefined, now), pending: 0 }];
+				[{ connection: "", account: "", marker: markerFor(child, undefined, now), elsewhere: null, pending: 0 }];
 		rendered = segment.set(renderSegmentBody(entries, config), labelChoice(config));
+	};
+
+	/**
+	 * Per connection, for `/mattermost status`: the account the credential last
+	 * proved itself to be, and who holds the right to listen for it. An
+	 * operator reading `elsewhere` here has the pid to go look at; an operator
+	 * reading `(no local record)` has a listener that has never authenticated
+	 * in this stateDir.
+	 */
+	const identityLines = (): string[] => {
+		if (!profile || !reader) return ["identity: (no profile read)"];
+		const facts = reader.read(false);
+		const now = Date.now();
+		const ownPid = watcher?.pid ?? null;
+		const ours = ownPid === null ? [] : [ownPid];
+		return profile.connections.map((connection) => {
+			const identity = facts.identities.get(connection.id);
+			const lock = lockFor(facts.locks, connection.id, identity?.scope ?? null);
+			const elsewhere = elsewhereLocator(lock, ours, now);
+			const name = identity
+				? `${identity.account} (${identity.userId}) resolved ${new Date(identity.resolvedAt).toISOString()}`
+				: "(no local record; nothing has authenticated in this stateDir)";
+			const held = elsewhere
+				? `watcher lock held ELSEWHERE ${elsewhere} — this session receives nothing`
+				: lock
+					? `watcher lock pid ${lock.pid} on ${lock.host}`
+					: "no watcher lock";
+			return `identity ${connection.id}: ${name}; ${held}`;
+		});
 	};
 
 	/** Unref'd: a footer refresh never holds the process open. */
@@ -523,6 +570,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 					`identity from: ${watcher.configSource ?? "nothing"}`,
 					`cli: ${watcher.command?.cli ?? "unresolved"}`,
 					`queued: ${queue.length}`,
+					...identityLines(),
 					`footer: ${rendered ?? "(nothing)"} (status key ${segment.key})`,
 					`footer fields: ${profile?.status.fields.join(", ") || "(none)"} / ${profile?.status.style ?? DEFAULT_STATUS.style}`,
 					// Named codepoint and all: an operator staring at tofu can

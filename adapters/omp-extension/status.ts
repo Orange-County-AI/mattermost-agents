@@ -58,7 +58,14 @@ export type ListenerMarker = "starting" | "retrying" | "auth" | "config" | "stal
 /** What this session's child is doing, as the supervisor sees it. */
 export type ChildState = "starting" | "running" | "failed";
 
-export const STATUS_FIELDS = ["label", "identity", "count"] as const;
+/**
+ * The two halves of an identity are separate fields, because they answer
+ * different questions: `connection` says which server-and-profile entry this
+ * is, `user` says which account the credential authenticated as. A footer
+ * that showed only the first named two agents sharing one account
+ * identically.
+ */
+export const STATUS_FIELDS = ["label", "connection", "user", "count"] as const;
 export type StatusField = (typeof STATUS_FIELDS)[number];
 export type StatusStyle = "compact" | "verbose";
 
@@ -75,14 +82,15 @@ export interface StatusConfig {
 }
 
 /**
- * Identity, and nothing else. Next to named connections a pending count says
- * little, so it is opt-in; the not-listening marker is not a field at all,
- * because it is the one thing this line exists to make visible and an
- * operator trimming the line must not be able to hide it. The label is the
- * brand glyph, because a footer is scanned rather than read.
+ * Who this session acts as, and nothing else: the connection and the account
+ * on it. Next to a named identity a pending count says little, so it is
+ * opt-in; neither the not-listening marker nor the lock-held-elsewhere marker
+ * is a field at all, because those are the things this line exists to make
+ * visible and an operator trimming the line must not be able to hide them.
+ * The label is the brand glyph, because a footer is scanned rather than read.
  */
 export const DEFAULT_STATUS: StatusConfig = {
-	fields: ["label", "identity"],
+	fields: ["label", "connection", "user"],
 	style: "compact",
 	label: DEFAULT_LABEL_STYLE,
 	glyph: null,
@@ -185,8 +193,14 @@ export function labelChoice(config: StatusConfig): LabelChoice {
 export interface ProfileConnection {
 	/** The connection id: what `watcher_health` and `events` are keyed by. */
 	readonly id: string;
-	/** What the footer shows for it. */
-	readonly identity: string;
+	/**
+	 * The account this connection acts as, as far as the PROFILE can say —
+	 * empty here, and deliberately so. A Mattermost profile pins
+	 * `expectedUserId`, twenty-six opaque characters that name nobody; the
+	 * readable name exists only after a credential authenticates, and the
+	 * listener records it in `watcher_identity` for this line to read.
+	 */
+	readonly account: string;
 }
 
 export interface ProfileFacts {
@@ -223,7 +237,7 @@ export function readProfileFacts(path: string): ProfileFacts {
 		if (typeof connection.id !== "string" || connection.id.length === 0) {
 			throw new Error(`${path} has a connection without an "id"`);
 		}
-		connections.push({ id: connection.id, identity: connection.id });
+		connections.push({ id: connection.id, account: "" });
 	}
 
 	let status = DEFAULT_STATUS;
@@ -248,16 +262,40 @@ export interface ListenerRow {
 	readonly errorKind: string | null;
 }
 
+/** One `watcher_identity` row: who a credential turned out to be, and when. */
+export interface IdentityRow {
+	/** The readable account name — a Mattermost username. */
+	readonly account: string;
+	readonly userId: string;
+	/** The AgentState scope this identity owns; the exact key of its lock row. */
+	readonly scope: string;
+	readonly resolvedAt: number;
+}
+
+/** One `watcher_lock` row: which process currently has the right to listen. */
+export interface LockRow {
+	readonly scope: string;
+	readonly pid: number;
+	readonly host: string;
+	readonly heartbeatAt: number;
+}
+
 export interface ListenerFacts {
 	readonly rows: Map<string, ListenerRow>;
 	readonly pending: Map<string, number>;
+	/** By connection id. Absent until a credential has authenticated at least once. */
+	readonly identities: Map<string, IdentityRow>;
+	/** Every lock row in the file, in the order SQLite returned them. */
+	readonly locks: readonly LockRow[];
 }
 
-const NOTHING_KNOWN: ListenerFacts = { rows: new Map(), pending: new Map() };
+const NOTHING_KNOWN: ListenerFacts = { rows: new Map(), pending: new Map(), identities: new Map(), locks: [] };
 
 const HEALTH_SQL =
 	"SELECT connection_id, reported, pid, host, heartbeat_at, last_error_kind FROM watcher_health";
 const PENDING_SQL = "SELECT connection, COUNT(*) AS pending FROM events WHERE acked_at IS NULL GROUP BY connection";
+const IDENTITY_SQL = "SELECT connection_id, scope, user_id, username, resolved_at FROM watcher_identity";
+const LOCK_SQL = "SELECT scope, pid, host, heartbeat_at FROM watcher_lock";
 
 interface HealthQueryRow {
 	connection_id: string;
@@ -273,17 +311,35 @@ interface PendingQueryRow {
 	pending: number;
 }
 
+interface IdentityQueryRow {
+	connection_id: string;
+	scope: string;
+	user_id: string;
+	username: string;
+	resolved_at: number;
+}
+
+interface LockQueryRow {
+	scope: string;
+	pid: number;
+	host: string;
+	heartbeat_at: number;
+}
+
 /**
- * Reads the listener's own state file, read-only and in process: two indexed
- * queries against the same SQLite the listener writes. No `status` subprocess
- * and no network — the footer must cost nothing, and the questions it asks
- * ("is anything listening", "how much is unanswered") are answered locally.
+ * Reads the listener's own state file, read-only and in process: a handful of
+ * small queries against the same SQLite the listener writes. No `status`
+ * subprocess and no network — the footer must cost nothing, and every question
+ * it asks ("is anything listening", "as whom", "does this session hold the
+ * right to listen at all", "how much is unanswered") is answered locally.
  */
 export class ListenerStateReader {
 	readonly #path: string;
 	readonly #note: (line: string) => void;
 	#db: Database | null = null;
 	#complained = false;
+	/** Which tables this file actually has, read once per open. */
+	#tables: Record<string, true> = {};
 
 	constructor(stateDir: string, note: (line: string) => void) {
 		this.#path = join(stateDir, "agent.sqlite");
@@ -317,7 +373,28 @@ export class ListenerStateReader {
 					pending.set(row.connection, row.pending);
 				}
 			}
-			return { rows, pending };
+			const identities = new Map<string, IdentityRow>();
+			// A state file written by a build older than `watcher_identity` has
+			// no such table, and this reader opens read-only so it cannot create
+			// one. Skipping the query costs the names and nothing else — the
+			// health rows and the lock still render.
+			if (this.#tables.watcher_identity) {
+				for (const row of db.query<IdentityQueryRow, []>(IDENTITY_SQL).all()) {
+					identities.set(row.connection_id, {
+						account: row.username,
+						userId: row.user_id,
+						scope: row.scope,
+						resolvedAt: row.resolved_at,
+					});
+				}
+			}
+			const locks = db.query<LockQueryRow, []>(LOCK_SQL).all().map((row) => ({
+				scope: row.scope,
+				pid: row.pid,
+				host: row.host,
+				heartbeatAt: row.heartbeat_at,
+			}));
+			return { rows, pending, identities, locks };
 		} catch (error) {
 			this.#note(`state read failed: ${String(error)}`);
 			this.close();
@@ -328,12 +405,20 @@ export class ListenerStateReader {
 	close(): void {
 		this.#db?.close(false);
 		this.#db = null;
+		this.#tables = {};
 	}
 
 	#open(): Database | null {
 		if (this.#db) return this.#db;
 		try {
-			this.#db = new Database(this.#path, { readonly: true });
+			const db = new Database(this.#path, { readonly: true });
+			// One catalogue read per open, so a table this build queries and an
+			// older writer never created is a missing fact rather than a thrown
+			// read that would blank the whole segment.
+			for (const row of db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all()) {
+				this.#tables[row.name] = true;
+			}
+			this.#db = db;
 			this.#complained = false;
 			return this.#db;
 		} catch (error) {
@@ -377,35 +462,154 @@ export function markerFor(child: ChildState, row: ListenerRow | undefined, now: 
 	return row.reported === "listening" ? null : "stale";
 }
 
+/**
+ * How far up a process tree this will look for one of our own pids. The child
+ * this session spawned normally IS the lock holder; the walk exists for the
+ * one configuration where it is not — `MATTERMOST_AGENT_CLI` naming a wrapper
+ * script, which puts the real watcher a generation or two down.
+ */
+const MAX_ANCESTRY = 8;
+
+/**
+ * `/proc/<pid>/stat`'s parent, or `null` at the top of the walk. The command
+ * name field is parenthesised and may itself contain spaces and parentheses,
+ * so the fields are counted from the LAST `)`: state, then ppid.
+ *
+ * Linux only, by construction. Everywhere else the walk stops immediately and
+ * ownership falls back to pid equality, which is the normal case anyway.
+ */
+function parentPid(pid: number): number | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const parent = Number(fields[1]);
+		// 1 is init: an orphan, which is no longer anybody's descendant.
+		return Number.isInteger(parent) && parent > 1 ? parent : null;
+	} catch {
+		return null;
+	}
+}
+
+function inTree(pid: number, roots: readonly number[]): boolean {
+	let current: number | null = pid;
+	for (let step = 0; current !== null && step <= MAX_ANCESTRY; step += 1) {
+		if (roots.includes(current)) return true;
+		current = parentPid(current);
+	}
+	return false;
+}
+
+/**
+ * The lock row for one connection. The recorded identity carries the exact
+ * scope its listener locks under, so that is the join. Without one — an old
+ * state file, or a credential that has never authenticated here — the
+ * connection id is the first field of every scope, and a single match is
+ * unambiguous; two identities sharing one stateDir under one connection id are
+ * not, so nothing is claimed rather than the wrong one.
+ */
+export function lockFor(
+	locks: readonly LockRow[],
+	connectionId: string,
+	scope: string | null,
+): LockRow | undefined {
+	if (scope !== null) return locks.find((lock) => lock.scope === scope);
+	const candidates = locks.filter((lock) => lock.scope.startsWith(`${connectionId}|`));
+	return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/**
+ * Where this connection's watcher lock lives when it does NOT belong to this
+ * session, as a locator to print; `null` when the lock is ours, dead, or
+ * absent.
+ *
+ * This is the failure `watcher_health` cannot show. That table is keyed by
+ * connection and origin only, so a listener held by ANOTHER session writes
+ * healthy rows into the same file: the segment reads `listening`, every
+ * credential works, and this session still receives nothing, because only the
+ * lock holder does. Two agents shared one account that way for a whole evening
+ * and the wrong one settled a human's approval.
+ *
+ * Liveness is the lock's own rule, imported rather than restated. Ownership is
+ * this session's spawned child and its descendants — a lock on another host
+ * can never be ours, because our child runs here.
+ */
+export function elsewhereLocator(lock: LockRow | undefined, ours: readonly number[], now: number): string | null {
+	if (!lock) return null;
+	const here = lock.host === hostname();
+	const live = lock.heartbeatAt > now - LOCK_STALE_MS && !(here && !processAlive(lock.pid));
+	if (!live) return null;
+	if (here && inTree(lock.pid, ours)) return null;
+	// A pid, because a pane cannot be attributed from local state: nothing in
+	// this file records which terminal a listener was started from, and asking
+	// the multiplexer would be the network call this line refuses to make.
+	return here ? `#${lock.pid}` : `#${lock.host}:${lock.pid}`;
+}
+
 export interface SegmentEntry {
-	/** Empty when there is no identity to name — a failure before the profile was read. */
-	readonly identity: string;
+	/** The connection id, empty only when there was no profile to read one from. */
+	readonly connection: string;
+	/** The account it acts as; empty when local state cannot name one yet. */
+	readonly account: string;
 	readonly marker: ListenerMarker | null;
+	/** The lock holder's locator when it is not this session's; never config-gated. */
+	readonly elsewhere: string | null;
 	readonly pending: number;
+}
+
+/**
+ * Binds an account to its connection. `·` already separates one connection
+ * from the next, and `/` binds tighter than `·` to the eye, so
+ * `ocai/stub·ticket500/stub` groups correctly without spending a space on it.
+ * It is also the conventional namespace separator (host/user, org/repo), and
+ * it collides with nothing either half may contain: Mattermost usernames are
+ * lowercase letters, digits and `. - _`, and a mail address has no slash.
+ */
+const ACCOUNT_SEPARATOR = "/";
+
+/**
+ * What to call one connection, given the field list. Two ways for that list to
+ * leave nothing to say: it names neither half, or the only half it names is a
+ * `user` local state cannot name yet. Either way a name still reaches this
+ * line, because the only reason it does is that something is wrong with this
+ * connection — and then it is the FULL name, connection and account both. Half
+ * a name is what let two sessions on one account look identical.
+ */
+function nameFor(entry: SegmentEntry, config: StatusConfig): string {
+	const parts: string[] = [];
+	if (config.fields.includes("connection")) parts.push(entry.connection);
+	if (config.fields.includes("user") && entry.account.length > 0) parts.push(entry.account);
+	if (parts.length > 0) return parts.join(ACCOUNT_SEPARATOR);
+	return entry.account.length > 0 ? `${entry.connection}${ACCOUNT_SEPARATOR}${entry.account}` : entry.connection;
 }
 
 /**
  * Everything the segment says after its label — the label itself belongs to
  * the shared line, which spaces it. Empty when the operator asked for none of
- * it; a label alone is still a segment. An unhealthy connection is named
- * whatever the field list says: the operator may shorten this line, never
- * blind it.
+ * it; a label alone is still a segment. A connection carrying a marker is
+ * named whatever the field list says: the operator may shorten this line,
+ * never blind it.
  */
 export function renderSegmentBody(entries: readonly SegmentEntry[], config: StatusConfig): string {
 	const compact = config.style === "compact";
 	const parts: string[] = [];
 
-	const withIdentity = config.fields.includes("identity");
-	const named = entries
-		.filter((entry) => (withIdentity && entry.identity.length > 0) || entry.marker !== null)
-		.map((entry) =>
-			entry.marker === null
-				? entry.identity
-				: compact
-					? `${entry.identity}!${entry.marker}`
-					: `${entry.identity} (${entry.marker})`.trim(),
-		);
-	if (named.length > 0) parts.push(named.join(compact ? "·" : ", "));
+	const named = config.fields.includes("connection") || config.fields.includes("user");
+	const shown = entries
+		.filter(
+			(entry) =>
+				(named && entry.connection.length > 0) || entry.marker !== null || entry.elsewhere !== null,
+		)
+		.map((entry) => {
+			const markers: string[] = [];
+			if (entry.marker !== null) markers.push(entry.marker);
+			if (entry.elsewhere !== null) markers.push(`elsewhere${entry.elsewhere}`);
+			const name = nameFor(entry, config);
+			if (markers.length === 0) return name;
+			return compact
+				? `${name}${markers.map((marker) => `!${marker}`).join("")}`
+				: `${name} (${markers.join(", ")})`.trim();
+		});
+	if (shown.length > 0) parts.push(shown.join(compact ? "·" : ", "));
 
 	if (config.fields.includes("count")) {
 		const pending = entries.reduce((total, entry) => total + entry.pending, 0);

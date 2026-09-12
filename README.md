@@ -74,7 +74,7 @@ is the convention used below — and `chmod 600` it.
 | `operatorUserIds` | your own account(s), by Mattermost user id. A post from one of these arrives as `sender_role="operator"`: it MAY contain instructions and the agent acts on them with its normal judgement. Per connection, because the same human is a different user id on every server. |
 | `automationUserIds` | automation accounts you trust the same way — schedulers, tick loops, CI. They arrive as `sender_role="automation"`. Separate from `operatorUserIds` so the agent can tell a robot from you, and so revoking one never touches the other. |
 | `pollIntervalMs` | REST sweep interval, 1000–600000. Default 5000. |
-| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose", "label": "glyph" \| "text" \| "none", "glyph": "…" }`, where `fields` is any of `label`, `identity` (the connection ids) and `count` (unanswered events). Default `{"fields": ["label", "identity"], "style": "compact", "label": "glyph"}` — the brand glyph and the identities, no count. `label` says which form the label takes: `glyph` is the Mattermost logo (`dev-mattermost`, U+E927), `text` is `mm` (`mattermost` on a verbose line), `none` is no label; a `fields` list without `label` renders none of them. `glyph` replaces that logo with any string of one or two terminal columns — for a font that does not have U+E927. Two things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`), and so is one whose credential was refused (`auth`) or whose config is broken (`config`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
+| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose", "label": "glyph" \| "text" \| "none", "glyph": "…" }`, where `fields` is any of `label`, `connection` (the connection id), `user` (the account the credential authenticates as) and `count` (unanswered events). Default `{"fields": ["label", "connection", "user"], "style": "compact", "label": "glyph"}` — the brand glyph and `connection/user`, no count; `["connection"]` shows the connection alone and `["user"]` the account alone. `label` says which form the label takes: `glyph` is the Mattermost logo (`dev-mattermost`, U+E927), `text` is `mm` (`mattermost` on a verbose line), `none` is no label; a `fields` list without `label` renders none of them. `glyph` replaces that logo with any string of one or two terminal columns — for a font that does not have U+E927. Three things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`); so is one whose credential was refused (`auth`) or whose config is broken (`config`); and so is one whose watcher lock is held by a live process outside this session (`!elsewhere#PID`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
 
 Export the token under the name the profile gives, and prove the identity
 before wiring anything into a harness:
@@ -151,18 +151,27 @@ segment first. Nothing here depends on the other integrations existing; with
 only this one installed the line is only this segment.
 
 ```
- ticket500·ocai │ 󰊫 stub@theticket500.com
+ ocai/stub·ticket500/stub │ 󰊫 ocai/stub@theticket500.com
 ```
 
 Each segment opens with its integration's brand logo — `dev-mattermost`
 (U+E927) here, `md-gmail` (U+F02AB) for the mailbox — then one space, then
-what it has to say. The default names the identities and nothing else: next
-to `ocai` a count says little, and a footer that talks while everything works
-is a footer nobody reads. What it always says is when something is NOT
-listening —
+what it has to say. The default names each connection AND the account this
+session acts as on it, `connection/user`: a connection id alone says which
+server, never which of two agents you are looking at, and two agents sharing
+one account once read identically here while only one of them was receiving
+anything. The account comes from the listener's own `watcher_identity` row —
+what a credential actually authenticated as, written at every successful
+authentication — not from the profile, which pins only an opaque user id. A
+connection nothing has authenticated for yet is named by its connection id
+alone rather than not at all.
+
+A count is opt-in: next to a named identity it says little, and a footer that
+talks while everything works is a footer nobody reads. What the line always
+says is when something is NOT listening —
 
 ```
- ticket500!stale·ocai
+ ocai/stub·ticket500/stub!stale
 ```
 
 — and that comes from the listener's own heartbeat in `stateDir`, the same
@@ -174,9 +183,29 @@ credential and `config` for a profile the listener cannot load. They stay
 words under every label style: a logo names an integration, it never
 diagnoses one.
 
+**And when the listener is healthy but it is not yours.**
+
+```
+ ocai/fleet!elsewhere#12127
+```
+
+`!elsewhere#PID` means the single-watcher lock for that connection is held by
+a live process outside this session's own listener — another pane, another
+agent, another window. It exists because `health: live` does not tell you
+that: `watcher_health` is keyed by connection and origin only, so the session
+that DOES hold the lock writes `listening` into the state file both sessions
+read, and the session that receives nothing reads the other one's good news
+as its own. Only the lock says who is actually being delivered to, so the
+lock is what this marker reports; the number is the holding pid, because
+nothing in local state records which pane a listener was started from and
+asking would be a call this line refuses to make. `/mattermost status` prints
+the same thing in full, with the host.
+
 The `status` block in the profile chooses the fields, the style and the label
-(see the profile table above); the marker is not a field and cannot be
-switched off.
+(see the profile table above); the markers are not fields and cannot be
+switched off. A field list that asks for no name at all still gets the full
+`connection/user` beside a marker — "something went deaf" is useless without
+"which identity".
 
 **If the label renders as a box.** That is tofu: your terminal font has no
 U+E927. Mattermost's logo needs a Nerd Fonts build at least as new as the one

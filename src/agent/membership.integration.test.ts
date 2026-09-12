@@ -63,7 +63,7 @@ function watcherFor(
     pollIntervalMs: 1000,
     ...conn,
   }
-  const state = AgentState.open({ stateDir, connectionId: connection.id, origin: fake.url, userId: SELF })
+  const state = AgentState.open({ stateDir, connectionId: connection.id, origin: fake.url, userId: SELF, username: 'fleet-security' })
   closing.push(state)
   const watcher = new ConnectionWatcher(connection, new MattermostClient(fake.url, TOKEN), state, TOKEN, SELF, {
     emit: (line) => lines.push(line),

@@ -75,6 +75,7 @@ export async function openSession(config: AgentConfig, connectionId: string): Pr
     connectionId: conn.id,
     origin: new URL(conn.url).origin,
     userId: me.id,
+    username: me.username,
   })
   const scope = channelScope(conn, client, me.id)
   // Membership mode needs the set before anything can be listed; static mode's

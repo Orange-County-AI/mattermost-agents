@@ -98,6 +98,34 @@ export interface WatcherHealthRow {
   heartbeat_at: number
 }
 
+/**
+ * Who one connection's credential actually turned out to be, written by the
+ * process that authenticated it.
+ *
+ * The profile pins an `expectedUserId` — 26 opaque characters that name nobody
+ * a human recognises — and nothing else in this file records the account the
+ * agent acts AS: `events.sender_username` is the other end of the
+ * conversation, and the scope string carries the user id, not the name. So a
+ * reader with only local state could say which server a session was pointed
+ * at and never which account it spoke as. Two agents once shared one account
+ * and one ledger, and no local reader could tell them apart.
+ *
+ * Keyed by connection id + origin, like `watcher_health`, so it is readable
+ * without knowing the identity first. `scope` is the exact scope string that
+ * authentication produced, which is what joins this row to its `watcher_lock`
+ * row without re-deriving anything.
+ */
+export interface WatcherIdentityRow {
+  connection_id: string
+  origin: string
+  /** `connection id|origin|user id` — the AgentState scope this identity owns. */
+  scope: string
+  user_id: string
+  username: string
+  /** When the credential last authenticated as this account. */
+  resolved_at: number
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
   scope TEXT NOT NULL,
@@ -166,6 +194,15 @@ CREATE TABLE IF NOT EXISTS watcher_health (
   started_at INTEGER NOT NULL,
   heartbeat_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watcher_identity (
+  key TEXT PRIMARY KEY,
+  connection_id TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  username TEXT NOT NULL,
+  resolved_at INTEGER NOT NULL
+);
 `
 
 /**
@@ -201,15 +238,38 @@ export class AgentState {
     this.scope = scope
   }
 
-  /** scope = connection id + origin + authenticated user, so state never crosses identities. */
-  static open(args: { stateDir: string; connectionId: string; origin: string; userId: string }): AgentState {
+  /**
+   * scope = connection id + origin + authenticated user, so state never crosses
+   * identities.
+   *
+   * Opening is only ever reached with an identity in hand — `openSession`
+   * authenticates first and refuses a credential that moved — so this is also
+   * where the resolved account is recorded. Every successful authentication
+   * refreshes the row, which is what lets a reader with nothing but this file
+   * say WHO a session acts as, not merely which server it dials.
+   */
+  static open(args: {
+    stateDir: string
+    connectionId: string
+    origin: string
+    userId: string
+    /** The username that user id answered to, from the same `/users/me` call. */
+    username: string
+  }): AgentState {
     mkdirSync(args.stateDir, { recursive: true })
     const db = new Database(join(args.stateDir, 'agent.sqlite'), { create: true })
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA busy_timeout = 5000')
     db.exec(SCHEMA)
     migrate(db)
-    return new AgentState(db, `${args.connectionId}|${args.origin}|${args.userId}`)
+    const scope = `${args.connectionId}|${args.origin}|${args.userId}`
+    db.query(
+      `INSERT INTO watcher_identity (key, connection_id, origin, scope, user_id, username, resolved_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (key) DO UPDATE SET scope = excluded.scope, user_id = excluded.user_id,
+         username = excluded.username, resolved_at = excluded.resolved_at`,
+    ).run(`${args.connectionId}|${args.origin}`, args.connectionId, args.origin, scope, args.userId, args.username, Date.now())
+    return new AgentState(db, scope)
   }
 
   close(): void {

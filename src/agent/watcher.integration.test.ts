@@ -189,7 +189,7 @@ beforeEach(() => {
 afterEach(() => fake.stop())
 
 function openWatcher(lines: string[], logs: string[]): { watcher: ConnectionWatcher; state: AgentState } {
-  const state = AgentState.open({ stateDir, connectionId: conn.id, origin: fake.url, userId: SELF })
+  const state = AgentState.open({ stateDir, connectionId: conn.id, origin: fake.url, userId: SELF, username: 'clem' })
   const watcher = new ConnectionWatcher(conn, new MattermostClient(fake.url, 'token'), state, 'token', SELF, {
     emit: (line) => lines.push(line),
     log: (line) => logs.push(line),
