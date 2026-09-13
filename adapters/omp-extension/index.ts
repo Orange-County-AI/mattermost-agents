@@ -566,7 +566,7 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 			ctx.ui.notify(
 				[
 					`status: ${describe(watcher.status)}`,
-					`config: ${watcher.config ?? `none (${CONFIG_ENV} unset, no project MCP profile)`}`,
+					`config: ${watcher.config ?? `none (${CONFIG_ENV} unset or identity contract inactive)`}`,
 					`identity from: ${watcher.configSource ?? "nothing"}`,
 					`cli: ${watcher.command?.cli ?? "unresolved"}`,
 					`queued: ${queue.length}`,

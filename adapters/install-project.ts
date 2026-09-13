@@ -1,43 +1,49 @@
 #!/usr/bin/env bun
 /**
- * Wire one OMP project to one Mattermost identity, and be able to undo it.
+ * Wire one OMP project to Mattermost, and be able to undo it.
+ *
+ * Pinned mode preserves the original one-project/one-identity behavior:
  *
  *   bun adapters/install-project.ts \
  *     --project /abs/path/to/worktree \
  *     --profile /abs/path/to/profile.json \
  *     --server-name mattermost-fleet-security
  *
+ * Shared-project mode installs one generic server. Every OMP process must name
+ * its own existing profile in `MATTERMOST_AGENT_CONFIG`; both the MCP child and
+ * this extension inherit that session environment:
+ *
+ *   bun adapters/install-project.ts \
+ *     --project /abs/path/to/worktree \
+ *     --shared-project \
+ *     --server-name mattermost-session
+ *
  * It touches exactly three files inside `<project>/.omp/`:
  *
  *   settings.json  `extensions` gains the extension ENTRY FILE — never the
  *                  directory, which OMP would scan, loading `locate.ts` and
  *                  `watcher.ts` as extensions of their own.
- *   mcp.json       `mcpServers` gains one identity-named stdio server running
- *                  the shared wrapper with `MATTERMOST_AGENT_CONFIG` pinned.
+ *   mcp.json       `mcpServers` gains one stdio server running the shared
+ *                  wrapper. Pinned mode sets `MATTERMOST_AGENT_CONFIG`;
+ *                  shared-project mode deliberately does not.
  *   .gitignore     keeps both of those, the install record and itself out of
- *                  the project's history: they pin one machine's paths and one
- *                  agent's identity, which belong to nobody else's checkout.
- *
- * That single pinned path is what the extension reads when the environment is
- * silent, so an ordinary `omp` launch or a saved-session resume in this
- * checkout listens as the same account its tools act as. No exported
- * variables, no launch flags.
+ *                  the project's history: they contain machine-local paths.
  *
  * What it refuses rather than guesses: a config path that is a symlink or
  * resolves outside the project (it would edit somebody else's config), an
- * existing server of the same name that is configured differently, a second
- * server pinning a different profile (two identities in one project is exactly
- * what the extension fails on), another checkout's copy of this extension
- * already in `extensions`, and an existing ignore rule that deliberately
- * un-ignores one of these files.
+ * existing server of the same name that is configured differently, ambiguous
+ * Mattermost server entries, another checkout's copy of this extension already
+ * in `extensions`, and an existing ignore rule that deliberately un-ignores
+ * one of these files.
  *
- * `--rollback` removes only what a previous run added, and only while the
- * files still hash to what that run left behind. The record it reads holds
- * paths, hashes and the lines this tool added — never a copy of a config body,
- * which may name secrets.
+ * Re-running a pinned install with `--shared-project` is the one supported
+ * migration. It is allowed only when this install record owns the existing
+ * server and its MCP file still has the recorded hash. `--rollback` removes
+ * only what a previous run added, and only while the files still hash to what
+ * that run left behind.
  *
- * Credentials are never read, written or logged here: the profile is a path,
- * and core alone resolves what is inside it.
+ * Credentials are never read, written or logged here: a pinned profile is only
+ * a path, and core alone resolves what is inside it.
  */
 
 import { createHash } from "node:crypto";
@@ -59,15 +65,17 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const EXTENSION_ENTRY = join(HERE, "omp-extension", "index.ts");
 const MCP_WRAPPER = join(HERE, "bin", "mattermost-mcp");
 const CONFIG_ENV = "MATTERMOST_AGENT_CONFIG";
-const RECORD_SCHEMA = "mattermost-agents/install-record/1";
+const RECORD_SCHEMA_V1 = "mattermost-agents/install-record/1";
+const RECORD_SCHEMA = "mattermost-agents/install-record/2";
 const RECORD_FILE = "mattermost-agents-install.json";
-const IGNORE_HEADER = "# Local Mattermost identity pins — machine-specific, never committed.";
+const IGNORE_HEADER = "# Local Mattermost harness wiring — machine-specific, never committed.";
 const IGNORED_FILES = ["mcp.json", "settings.json", RECORD_FILE, ".gitignore"];
 /** EX_CONFIG, as the wrappers use: this is a setup problem, not a crash. */
 const EX_CONFIG = 78;
 
 const USAGE = `usage:
   install-project.ts --project <dir> --profile <file> --server-name <name> [--dry-run]
+  install-project.ts --project <dir> --shared-project --server-name <name> [--dry-run]
   install-project.ts --project <dir> --rollback [--dry-run]`;
 
 /** The slices of the OMP files this installer owns; everything else is preserved verbatim. */
@@ -93,14 +101,34 @@ interface FileRecord {
 	addedLines?: string[];
 }
 
+type InstallMode = "pinned" | "shared";
+
 interface InstallRecord {
-	schema: string;
+	schema: typeof RECORD_SCHEMA;
 	installedAt: string;
 	adapters: string;
+	mode: InstallMode;
 	serverName: string;
-	profile: string;
+	profile?: string;
 	extensionEntry: string;
 	files: Record<string, FileRecord>;
+}
+
+interface StoredInstallRecord {
+	schema?: unknown;
+	installedAt?: unknown;
+	adapters?: unknown;
+	mode?: unknown;
+	serverName?: unknown;
+	profile?: unknown;
+	extensionEntry?: unknown;
+	files?: unknown;
+}
+
+interface InstallRequest {
+	mode: InstallMode;
+	serverName: string;
+	profile?: string;
 }
 
 function fail(message: string): never {
@@ -147,6 +175,67 @@ function readJsonObject(path: string, label: string): Record<string, unknown> {
 		fail(`${label} ${path} does not contain a JSON object`);
 	}
 	return parsed as Record<string, unknown>;
+}
+
+function readInstallRecord(path: string): { record: InstallRecord; upgradedFromV1: boolean } {
+	const raw = readJsonObject(path, "install record") as StoredInstallRecord;
+	if (raw.schema !== RECORD_SCHEMA && raw.schema !== RECORD_SCHEMA_V1) {
+		fail(`${path} is schema ${String(raw.schema)}, not ${RECORD_SCHEMA} or ${RECORD_SCHEMA_V1}`);
+	}
+	if (
+		typeof raw.installedAt !== "string" ||
+		typeof raw.adapters !== "string" ||
+		typeof raw.serverName !== "string" ||
+		typeof raw.extensionEntry !== "string" ||
+		!raw.files ||
+		typeof raw.files !== "object" ||
+		Array.isArray(raw.files)
+	) {
+		fail(`${path} is not a valid Mattermost install record`);
+	}
+
+	const upgradedFromV1 = raw.schema === RECORD_SCHEMA_V1;
+	const mode = upgradedFromV1 ? "pinned" : raw.mode;
+	if (mode !== "pinned" && mode !== "shared") fail(`${path} has invalid install mode ${String(mode)}`);
+	if (mode === "pinned" && (typeof raw.profile !== "string" || raw.profile.length === 0)) {
+		fail(`${path} records pinned mode without a profile`);
+	}
+	if (mode === "shared" && raw.profile !== undefined) {
+		fail(`${path} records shared mode with a profile; refusing an ambiguous identity binding`);
+	}
+
+	const files: Record<string, FileRecord> = {};
+	for (const [file, value] of Object.entries(raw.files)) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			fail(`${path} has an invalid file record for ${file}`);
+		}
+		const state = value as Partial<FileRecord>;
+		if (
+			(state.owns !== "extension" && state.owns !== "server" && state.owns !== "lines") ||
+			typeof state.created !== "boolean" ||
+			(state.sha256Before !== null && typeof state.sha256Before !== "string") ||
+			typeof state.sha256After !== "string" ||
+			(state.addedLines !== undefined &&
+				(!Array.isArray(state.addedLines) || state.addedLines.some((line) => typeof line !== "string")))
+		) {
+			fail(`${path} has an invalid file record for ${file}`);
+		}
+		files[file] = state as FileRecord;
+	}
+
+	return {
+		record: {
+			schema: RECORD_SCHEMA,
+			installedAt: raw.installedAt,
+			adapters: raw.adapters,
+			mode,
+			serverName: raw.serverName,
+			...(mode === "pinned" ? { profile: raw.profile as string } : {}),
+			extensionEntry: raw.extensionEntry,
+			files,
+		},
+		upgradedFromV1,
+	};
 }
 
 /**
@@ -215,7 +304,7 @@ function planSettings(path: string, entry: string): Plan | string {
 	};
 }
 
-function planMcp(path: string, serverName: string, profile: string): Plan | string {
+function planMcp(path: string, request: InstallRequest, migrateOwnedPin: boolean): Plan | string {
 	const existed = existsSync(path);
 	const file: McpFile = existed ? readJsonObject(path, "project MCP config") : {};
 	const configured = file.mcpServers;
@@ -223,19 +312,47 @@ function planMcp(path: string, serverName: string, profile: string): Plan | stri
 		fail(`project MCP config ${path} has a non-object "mcpServers"`);
 	}
 	const servers: Record<string, unknown> = { ...(configured ?? {}) };
+	let target: "missing" | "configured" | "migrate" = "missing";
 
 	for (const [name, entry] of Object.entries(servers)) {
-		if (!entry || typeof entry !== "object") continue;
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
 		const { command, env } = entry as { command?: unknown; env?: Record<string, unknown> };
-		const pinned = env && typeof env === "object" ? env[CONFIG_ENV] : undefined;
-		if (name === serverName) {
-			if (command === MCP_WRAPPER && pinned === profile) return `server "${name}" is already configured`;
+		const hasConfig = Boolean(env && typeof env === "object" && Object.hasOwn(env, CONFIG_ENV));
+		const pinned = hasConfig ? env?.[CONFIG_ENV] : undefined;
+		const isMattermost = command === MCP_WRAPPER;
+
+		if (name === request.serverName) {
+			if (request.mode === "pinned" && isMattermost && pinned === request.profile) {
+				target = "configured";
+				continue;
+			}
+			if (request.mode === "shared" && isMattermost && !hasConfig) {
+				target = "configured";
+				continue;
+			}
+			if (request.mode === "shared" && migrateOwnedPin && isMattermost && typeof pinned === "string") {
+				target = "migrate";
+				continue;
+			}
 			fail(
 				`project MCP config ${path} already has a server named "${name}" with different settings; ` +
 					"resolve it by hand or choose another --server-name",
 			);
 		}
-		if (typeof pinned === "string" && pinned !== profile) {
+
+		if (isMattermost && !hasConfig) {
+			fail(
+				`project MCP config ${path} already has a shared-project Mattermost server named "${name}"; ` +
+					"refusing to add a second generic server",
+			);
+		}
+		if (request.mode === "shared" && hasConfig) {
+			fail(
+				`project MCP config ${path} already sets ${CONFIG_ENV} on server "${name}"; ` +
+					"shared-project mode requires one generic Mattermost server and no project identity pin",
+			);
+		}
+		if (request.mode === "pinned" && typeof pinned === "string" && pinned !== request.profile) {
 			fail(
 				`project MCP config ${path} already pins ${CONFIG_ENV}=${pinned} on server "${name}"; ` +
 					"two identities in one project is what the listener refuses to guess between",
@@ -243,19 +360,30 @@ function planMcp(path: string, serverName: string, profile: string): Plan | stri
 		}
 	}
 
-	servers[serverName] = { command: MCP_WRAPPER, env: { [CONFIG_ENV]: profile } };
+	if (target === "configured") {
+		return `server "${request.serverName}" is already configured in ${request.mode === "pinned" ? "pinned" : "shared-project"} mode`;
+	}
+	servers[request.serverName] =
+		request.mode === "pinned"
+			? { command: MCP_WRAPPER, env: { [CONFIG_ENV]: request.profile } }
+			: { command: MCP_WRAPPER };
 	return {
 		path,
 		owns: "server",
 		existed,
 		sha256Before: existed ? digest(path) : null,
 		body: asJson({ ...file, mcpServers: servers }),
-		change: `mcpServers += "${serverName}" → ${profile}`,
+		change:
+			target === "migrate"
+				? `migrate mcpServers["${request.serverName}"] from pinned to shared-project mode`
+				: request.mode === "pinned"
+					? `mcpServers += "${request.serverName}" → ${request.profile}`
+					: `mcpServers += "${request.serverName}" → shared-project identity`,
 	};
 }
 
 /**
- * Keep the identity pins out of the project's history. Only `.omp/.gitignore`
+ * Keep the harness wiring out of the project's history. Only `.omp/.gitignore`
  * is touched — never the repository root's, and never `.git/info/exclude`,
  * which is shared by every worktree of the same repository.
  */
@@ -276,7 +404,7 @@ function planGitignore(path: string): Plan | string {
 		}
 		if (!present) missing.push(`/${file}`);
 	}
-	if (missing.length === 0) return `${path} already ignores the identity pins`;
+	if (missing.length === 0) return `${path} already ignores the Mattermost harness wiring`;
 
 	const added = existed ? missing : [IGNORE_HEADER, ...missing];
 	const head = previous.length === 0 || previous.endsWith("\n") ? previous : `${previous}\n`;
@@ -291,9 +419,9 @@ function planGitignore(path: string): Plan | string {
 	};
 }
 
-function install(projectDir: string, profileArg: string, serverName: string, dryRun: boolean): void {
-	if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(serverName)) {
-		fail(`--server-name ${serverName} is not a valid MCP server name`);
+function install(projectDir: string, requested: InstallRequest, dryRun: boolean): void {
+	if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(requested.serverName)) {
+		fail(`--server-name ${requested.serverName} is not a valid MCP server name`);
 	}
 	for (const [label, path] of [
 		["extension entry", EXTENSION_ENTRY],
@@ -307,11 +435,17 @@ function install(projectDir: string, profileArg: string, serverName: string, dry
 	if (!existsSync(project) || !statSync(project).isDirectory()) fail(`--project ${project} is not a directory`);
 	const projectReal = realpathSync(project);
 
-	const profile = resolve(profileArg);
-	if (lstatSync(profile, { throwIfNoEntry: false })?.isSymbolicLink()) {
-		fail(`--profile ${profile} is a symlink; pin the real profile path so the listener and the tools agree`);
+	const request: InstallRequest =
+		requested.mode === "pinned"
+			? { ...requested, profile: resolve(requested.profile as string) }
+			: { mode: "shared", serverName: requested.serverName };
+	if (request.mode === "pinned") {
+		const profile = request.profile as string;
+		if (lstatSync(profile, { throwIfNoEntry: false })?.isSymbolicLink()) {
+			fail(`--profile ${profile} is a symlink; pin the real profile path so the listener and the tools agree`);
+		}
+		if (!existsSync(profile) || !statSync(profile).isFile()) fail(`--profile ${profile} is not a file`);
 	}
-	if (!existsSync(profile) || !statSync(profile).isFile()) fail(`--profile ${profile} is not a file`);
 
 	const ompDir = join(project, ".omp");
 	assertWritablePath(ompDir, projectReal, "project config directory");
@@ -331,23 +465,45 @@ function install(projectDir: string, profileArg: string, serverName: string, dry
 	// A repair run re-plans only the files that need it. The additions this tool
 	// already owns in the others are still there, so their records carry over —
 	// dropping them would leave rollback nothing to take back.
-	let previousFiles: Record<string, FileRecord> = {};
+	let previous: InstallRecord | null = null;
+	let upgradeRecord = false;
+	let migrateOwnedPin = false;
 	if (existsSync(recordPath)) {
-		const previous = readJsonObject(recordPath, "install record") as unknown as InstallRecord;
-		if (previous.serverName !== serverName || previous.profile !== profile) {
+		const loaded = readInstallRecord(recordPath);
+		previous = loaded.record;
+		upgradeRecord = loaded.upgradedFromV1;
+		if (previous.serverName !== request.serverName) {
 			fail(
-				`${recordPath} records an install of "${previous.serverName}" → ${previous.profile}; ` +
+				`${recordPath} records a ${previous.mode} install named "${previous.serverName}"; ` +
+					"roll that back before installing a differently named server here",
+			);
+		}
+		if (previous.mode === "pinned" && request.mode === "pinned" && previous.profile !== request.profile) {
+			fail(
+				`${recordPath} records pinned profile ${previous.profile}; ` +
 					"roll that back before installing a different identity here",
 			);
 		}
-		if (previous.files && typeof previous.files === "object") previousFiles = previous.files;
+		if (previous.mode === "shared" && request.mode === "pinned") {
+			fail(`${recordPath} records shared-project mode; roll it back before installing a pinned identity`);
+		}
+		if (previous.mode === "pinned" && request.mode === "shared") {
+			const owned = previous.files[mcpPath];
+			if (!owned || owned.owns !== "server") {
+				fail(`${recordPath} does not own ${mcpPath}; refusing to migrate an ambiguous MCP entry`);
+			}
+			if (existsSync(mcpPath) && digest(mcpPath) !== owned.sha256After) {
+				fail(`${mcpPath} changed since the pinned install; refusing to replace an entry this run no longer owns`);
+			}
+			migrateOwnedPin = true;
+		}
 	}
 
 	const plans: Plan[] = [];
 	const skipped: string[] = [];
 	for (const planned of [
 		planSettings(settingsPath, EXTENSION_ENTRY),
-		planMcp(mcpPath, serverName, profile),
+		planMcp(mcpPath, request, migrateOwnedPin),
 		planGitignore(ignorePath),
 	]) {
 		if (typeof planned === "string") skipped.push(planned);
@@ -356,7 +512,8 @@ function install(projectDir: string, profileArg: string, serverName: string, dry
 
 	for (const note of skipped) process.stdout.write(`already done: ${note}\n`);
 	for (const plan of plans) process.stdout.write(`${plan.existed ? "update" : "create"} ${plan.path}: ${plan.change}\n`);
-	if (plans.length === 0) {
+	if (upgradeRecord) process.stdout.write(`update ${recordPath}: ${RECORD_SCHEMA_V1} → ${RECORD_SCHEMA}\n`);
+	if (plans.length === 0 && !upgradeRecord) {
 		process.stdout.write("nothing to do\n");
 		return;
 	}
@@ -366,6 +523,7 @@ function install(projectDir: string, profileArg: string, serverName: string, dry
 	}
 
 	mkdirSync(ompDir, { recursive: true });
+	const previousFiles = previous?.files ?? {};
 	const files: Record<string, FileRecord> = { ...previousFiles };
 	for (const plan of plans) {
 		writeAtomic(plan.path, plan.body);
@@ -378,23 +536,26 @@ function install(projectDir: string, profileArg: string, serverName: string, dry
 			created: prior ? prior.created : !plan.existed,
 			sha256Before: prior ? prior.sha256Before : plan.sha256Before,
 			sha256After: digest(plan.path),
-			...(plan.addedLines ? { addedLines: plan.addedLines } : {}),
+			...(plan.addedLines ? { addedLines: plan.addedLines } : prior?.addedLines ? { addedLines: prior.addedLines } : {}),
 		};
 	}
 
 	const record: InstallRecord = {
 		schema: RECORD_SCHEMA,
-		installedAt: new Date().toISOString(),
+		installedAt: previous?.installedAt ?? new Date().toISOString(),
 		adapters: HERE,
-		serverName,
-		profile,
+		mode: request.mode,
+		serverName: request.serverName,
+		...(request.mode === "pinned" ? { profile: request.profile as string } : {}),
 		extensionEntry: EXTENSION_ENTRY,
 		files,
 	};
 	writeAtomic(recordPath, asJson(record));
 	process.stdout.write(`wrote ${recordPath}\n`);
 	process.stdout.write(
-		`done. ${project} now resumes as "${serverName}"; no environment variable and no launch flag is needed.\n`,
+		request.mode === "pinned"
+			? `done. ${project} now resumes as "${request.serverName}"; no environment variable and no launch flag is needed.\n`
+			: `done. ${project} now uses per-session Mattermost identities; launch each OMP process with ${CONFIG_ENV}=<profile>.\n`,
 	);
 }
 
@@ -436,8 +597,7 @@ function rollback(projectDir: string, dryRun: boolean): void {
 	const ompDir = join(project, ".omp");
 	const recordPath = join(ompDir, RECORD_FILE);
 	if (!existsSync(recordPath)) fail(`no install record at ${recordPath}; nothing this tool installed`);
-	const record = readJsonObject(recordPath, "install record") as unknown as InstallRecord;
-	if (record.schema !== RECORD_SCHEMA) fail(`${recordPath} is schema ${record.schema}, not ${RECORD_SCHEMA}`);
+	const { record } = readInstallRecord(recordPath);
 
 	// The record is a file on disk like any other: it says what to undo, it does
 	// not get to say where. Only this project's own config files are in scope,
@@ -485,9 +645,13 @@ for (let index = 0; index < args.length; index += 1) {
 	const arg = args[index];
 	if (!arg.startsWith("--")) fail(`unexpected argument ${arg}\n${USAGE}`);
 	const [name, inline] = arg.slice(2).split(/=(.*)/s);
-	if (name === "rollback" || name === "dry-run" || name === "help") {
+	if (name === "rollback" || name === "dry-run" || name === "help" || name === "shared-project") {
+		if (inline !== undefined) fail(`--${name} does not take a value\n${USAGE}`);
 		flags.add(name);
 		continue;
+	}
+	if (name !== "project" && name !== "profile" && name !== "server-name") {
+		fail(`unknown option --${name}\n${USAGE}`);
 	}
 	const value = inline ?? args[++index];
 	if (value === undefined) fail(`--${name} needs a value\n${USAGE}`);
@@ -503,10 +667,23 @@ const projectOption = options.get("project");
 if (!projectOption) fail(`--project is required\n${USAGE}`);
 
 if (flags.has("rollback")) {
+	if (flags.has("shared-project") || options.has("profile") || options.has("server-name")) {
+		fail(`--rollback cannot be combined with install options\n${USAGE}`);
+	}
 	rollback(projectOption, flags.has("dry-run"));
 } else {
 	const profileOption = options.get("profile");
 	const serverOption = options.get("server-name");
-	if (!profileOption || !serverOption) fail(`--profile and --server-name are required\n${USAGE}`);
-	install(projectOption, profileOption, serverOption, flags.has("dry-run"));
+	const shared = flags.has("shared-project");
+	if (!serverOption) fail(`--server-name is required\n${USAGE}`);
+	if (shared === Boolean(profileOption)) {
+		fail(`choose exactly one of --profile <file> or --shared-project\n${USAGE}`);
+	}
+	install(
+		projectOption,
+		shared
+			? { mode: "shared", serverName: serverOption }
+			: { mode: "pinned", serverName: serverOption, profile: profileOption as string },
+		flags.has("dry-run"),
+	);
 }

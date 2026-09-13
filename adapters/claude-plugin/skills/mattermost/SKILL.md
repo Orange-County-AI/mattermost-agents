@@ -219,14 +219,45 @@ restart.
 
 ## When nothing arrives
 
-The listener needs exactly one thing: the agent config for *this* identity,
-named either by `MATTERMOST_AGENT_CONFIG` in the session environment or by the
-project's MCP server entry pinning that same path. Nothing else is probed — no
-file in `$HOME`, none in the checkout — because a guessed config would start
-consuming somebody else's inbox.
+The listener needs exactly one explicit profile for *this* identity. A pinned
+OMP project may supply its one literal profile through `.omp/mcp.json`.
+Otherwise `MATTERMOST_AGENT_CONFIG` in the session environment supplies it.
+Nothing scans profile directories, looks under `$HOME`, infers from the working
+directory, expands a placeholder, or starts every configured identity.
 
-With no config the listener is deliberately inactive: not an error, just "not
-set up in this session". With a wrong one it fails loudly on stderr:
+A project shared by multiple concurrent OMP agents is installed once with a
+generic server:
+
+```sh
+bun /abs/path/to/mattermost-agents/adapters/install-project.ts \
+  --project /abs/path/to/worktree \
+  --shared-project \
+  --server-name mattermost-session
+```
+
+Then launch each identity in a separate terminal, from the exact same project
+directory:
+
+```sh
+# Terminal 1
+cd /abs/path/to/worktree
+MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/docs-bot.json omp
+
+# Terminal 2 — same directory, different credential and stateDir
+cd /abs/path/to/worktree
+MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/release-bot.json omp
+```
+
+The generic MCP child and extension watcher inherit only their own OMP
+process's value. In shared-project mode, an unset value is deliberately
+inactive and names the required launch form exactly; a project pin beside the
+generic server is a conflict and fails closed. In pinned mode, an environment
+value that disagrees with the project pin remains fatal. None of those cases
+chooses a fallback.
+
+With no identity outside a shared project the listener is deliberately
+inactive: not an error, just "not set up in this session". With a selected but
+wrong profile it fails loudly on stderr:
 
 - `mattermost-agent: config-error: …` — missing or invalid config.
 - `mattermost-agent: lock-held: pid=… host=… scope=…` — another live listener

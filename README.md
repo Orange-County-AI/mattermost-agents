@@ -96,7 +96,7 @@ stops the agent instead of impersonating someone.
 
 ### OMP
 
-One command per project, run from this repository:
+The default is a pinned single-profile install, unchanged from earlier releases:
 
 ```sh
 bun adapters/install-project.ts \
@@ -110,35 +110,73 @@ It edits three files inside `<project>/.omp/` and nothing else:
 - `settings.json` — `extensions` gains the extension **entry file**,
   `adapters/omp-extension/index.ts`. Never the directory: OMP would scan it and
   try to load the helper modules beside it as extensions of their own.
-- `mcp.json` — `mcpServers` gains one **identity-named** stdio server (that is
-  what `--server-name` is for) running `adapters/bin/mattermost-mcp` with
-  `MATTERMOST_AGENT_CONFIG` pinned to your profile as a **literal path**.
+- `mcp.json` — `mcpServers` gains one stdio server running
+  `adapters/bin/mattermost-mcp`.
 - `.omp/.gitignore` — keeps those, the install record and itself out of the
-  project's history; they pin one machine's paths and one agent's identity.
+  project's history because they contain machine-local paths.
 
-That pinned path is the whole mechanism. The extension reads the project's
-`.omp/mcp.json` when the environment is silent, so **no exported variables and
-no launch flags are needed**: an ordinary `omp` launch, or a resume of a saved
-session in that checkout, listens as exactly the account its MCP tools act as.
-All your usual launcher flags keep working. If the environment *and* the
-project file disagree about the identity, nothing starts — listening as one
-account while the tools answer as another is worse than not listening.
+In pinned mode the server entry embeds the profile's literal path. The
+extension reads the same pin when the environment is silent, so an ordinary
+`omp` launch or saved-session resume uses exactly the account its MCP tools use.
+If `MATTERMOST_AGENT_CONFIG` is also set, it must resolve to that same path;
+disagreement remains fatal.
 
-`--dry-run` reports the plan and changes nothing. `--rollback` removes only
-what a previous run added, and only while the files still hash to what that run
-left behind.
+For multiple OMP processes in the **same project directory**, install explicit
+shared-project mode once:
+
+```sh
+bun adapters/install-project.ts \
+  --project /abs/path/to/worktree \
+  --shared-project \
+  --server-name mattermost-session
+```
+
+That server entry contains only the wrapper command—no profile, placeholder,
+profile scan, or list of identities. Each OMP process selects one existing
+profile in its own environment. For example, launch these in two terminals:
+
+```sh
+# Terminal 1
+cd /abs/path/to/worktree
+MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/docs-bot.json omp
+
+# Terminal 2 — the same working directory, a different account and stateDir
+cd /abs/path/to/worktree
+MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/release-bot.json omp
+```
+
+The generic MCP child and extension watcher inherit only their OMP process's
+selection. Each profile must retain its own credential and `stateDir`. With the
+variable unset, the shared-project watcher is inactive and reports:
+
+```text
+<project>/.omp/mcp.json server "mattermost-session" (shared-project mode) requires MATTERMOST_AGENT_CONFIG; launch OMP with MATTERMOST_AGENT_CONFIG=/absolute/path/to/profile.json
+```
+
+A generic server beside a project pin, multiple generic servers, an unresolved
+placeholder, or a missing selected profile fails closed; no profile is guessed
+and no set of configured identities is started.
+
+The install record uses `mattermost-agents/install-record/2` and records
+`mode: "pinned"` or `mode: "shared"`. Re-running the same command is
+idempotent. To migrate an installer-owned pinned project, run the
+`--shared-project` command with the **same** `--server-name`; migration removes
+only that owned profile pin and refuses if `.omp/mcp.json` changed or the entry
+has no matching install record. `--dry-run` reports the plan.
+`--rollback` removes only recorded additions while their files retain the
+recorded hashes.
 
 **A newly installed JavaScript extension needs the session restarted.** OMP
 loads extension factories at session start; `/reload-plugins` does not pick up
-an extension that was not loaded, so install, then restart — resuming the saved
+an extension that was not loaded, so install, then restart—resuming the saved
 session preserves the conversation. Once loaded, `/mattermost status` reports
 the listener's state, the config it resolved, where that identity came from,
 and the last few diagnostics; `/mattermost start|stop|restart` control it.
 
 The extension delivers messages and owns `/mattermost`; it ships no skill of
 its own. Give the agent the operating rules by installing this repository's
-root `SKILL.md` wherever that harness loads skills from — copy it, or symlink
-it if your loader follows links. It is the canonical text for both harnesses.
+root `SKILL.md` wherever that harness loads skills from—copy it, or symlink it
+if your loader follows links. It is the canonical text for both harnesses.
 
 #### What the footer shows
 

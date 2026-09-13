@@ -155,7 +155,7 @@ export class CoreWatcher {
 		return this.#config?.path ?? null;
 	}
 
-	/** Where that identity came from — the environment or the project MCP file. */
+	/** Where that identity came from — the environment and optional project contract. */
 	get configSource(): string | null {
 		return this.#config?.detail ?? null;
 	}
@@ -167,8 +167,9 @@ export class CoreWatcher {
 
 	/**
 	 * Resolve identity and CLI, then start one child. `inactive` means this
-	 * session was never pointed at a Mattermost identity; `failed` means it was
-	 * and something is wrong — including two sources naming different accounts.
+	 * session has no identity, including a shared project launched without its
+	 * required environment selection. `failed` means a configured contract is
+	 * broken or conflicting.
 	 */
 	start(): WatcherStatus {
 		if (this.#child || this.#restartTimer) return this.#status;
@@ -179,7 +180,13 @@ export class CoreWatcher {
 		if (config === null) {
 			return this.#setStatus({ kind: "inactive", detail: inactiveReason(this.#options.cwd) });
 		}
-		if (!config.ok) return this.#setStatus({ kind: "failed", detail: config.reason });
+		if (!config.ok) {
+			return this.#setStatus(
+				"inactive" in config && config.inactive
+					? { kind: "inactive", detail: config.reason }
+					: { kind: "failed", detail: config.reason },
+			);
+		}
 
 		const command = resolveCoreCommand(this.#options.env);
 		if (!command.ok) return this.#setStatus({ kind: "failed", detail: command.reason });

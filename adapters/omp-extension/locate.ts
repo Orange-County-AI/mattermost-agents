@@ -1,23 +1,20 @@
 /**
  * What to spawn: the core CLI, the bun that runs it, and the config file.
  *
- * Identity is never guessed. It comes from exactly two explicit places:
- * `MATTERMOST_AGENT_CONFIG` in the session environment, and the project MCP
- * file OMP already reads for this working directory, `<cwd>/.omp/mcp.json`,
- * where a server entry pins that same variable in its own `env`. That file is
- * the one place a project declares which Mattermost account its tools act as,
- * so a listener reading it stays the same account as the tools — and an
- * operator gets a working listener from an ordinary `omp` launch, with no
- * shell exports and no extra flags.
+ * Identity is never guessed. A pinned project names one literal profile in the
+ * `MATTERMOST_AGENT_CONFIG` field of `<cwd>/.omp/mcp.json`; the session
+ * environment may only agree with it. A shared project has one generic
+ * Mattermost MCP server with no such field, and each OMP process must select
+ * its own profile through `MATTERMOST_AGENT_CONFIG`. The MCP child and this
+ * extension then inherit the same selection.
  *
  * Nothing else is searched: no ancestor directory, no `$HOME`, no default
- * profile. An adapter that guessed a config out of the filesystem would start
- * consuming somebody else's inbox on any machine that happened to have a file
- * there. Both unset means inactive, which is not an error; two sources that
- * disagree is an error, and so is one that cannot be read literally.
+ * profile, no profile directory. A missing shared-project selection is
+ * inactive with an exact launch diagnostic. A pinned/environment disagreement,
+ * multiple generic servers, or a generic server beside a pin fails closed.
  *
- * The wrappers in `adapters/bin/` deliberately implement only the environment
- * half of this: they are plain `sh` and run under harnesses with no project
+ * The wrappers in `adapters/bin/` deliberately implement only environment
+ * selection: they are plain `sh` and run under harnesses with no project
  * directory of their own.
  */
 
@@ -31,6 +28,8 @@ export const BUN_ENV = "MATTERMOST_AGENT_BUN";
 
 /** `adapters/omp-extension/locate.ts` → `<repo>/src/agent/cli.ts`. */
 const DEFAULT_CLI = resolve(dirname(fileURLToPath(import.meta.url)), "../../src/agent/cli.ts");
+/** The exact generic MCP wrapper installed beside this extension. */
+const MATTERMOST_MCP = resolve(dirname(fileURLToPath(import.meta.url)), "../bin/mattermost-mcp");
 
 export type Env = Record<string, string | undefined>;
 
@@ -128,6 +127,18 @@ export interface ConfigChoice {
 	detail: string;
 }
 
+interface ProjectChoice {
+	mode: "pinned" | "shared";
+	/** Present only in pinned mode. */
+	path?: string;
+	/** Human-readable project declaration. */
+	detail: string;
+}
+
+export type SessionConfigResolution =
+	| Resolution<ConfigChoice>
+	| { ok: false; inactive: true; reason: string };
+
 export function projectMcpPath(cwd: string): string {
 	return join(cwd, ...PROJECT_MCP);
 }
@@ -138,7 +149,10 @@ export function projectMcpPath(cwd: string): string {
  * its own schema for the rest of it.
  */
 interface ProjectMcpFile {
-	mcpServers?: Record<string, { enabled?: unknown; env?: Record<string, unknown> } | undefined>;
+	mcpServers?: Record<
+		string,
+		{ command?: unknown; enabled?: unknown; env?: Record<string, unknown> } | undefined
+	>;
 	disabledServers?: unknown;
 	enabledServers?: unknown;
 }
@@ -169,15 +183,14 @@ function literalPath(value: string): Resolution<string> {
 }
 
 /**
- * The identity `<cwd>/.omp/mcp.json` pins, if any: the one config path that
- * enabled server entries agree on.
+ * The identity contract in `<cwd>/.omp/mcp.json`, if any.
  *
- * `null` when the file is absent, has no server map, or no server pins
- * `MATTERMOST_AGENT_CONFIG` — none of which is an error. Two servers pinning
- * different configs is: that project declares two identities and there is no
- * defensible way to pick one, so nothing starts.
+ * A pinned project has exactly one literal `MATTERMOST_AGENT_CONFIG` value.
+ * A shared project has exactly one enabled server invoking this checkout's
+ * Mattermost wrapper and omits that key entirely, allowing the MCP child to
+ * inherit the OMP process's value. Mixing those forms is an error.
  */
-export function resolveProjectConfig(cwd: string): Resolution<ConfigChoice> | null {
+export function resolveProjectConfig(cwd: string): Resolution<ProjectChoice> | null {
 	const file = projectMcpPath(cwd);
 	if (fileMode(file) === null) return null;
 
@@ -199,18 +212,29 @@ export function resolveProjectConfig(cwd: string): Resolution<ConfigChoice> | nu
 
 	/** Resolved config path → the server names that pin it. */
 	const pinned = new Map<string, string[]>();
+	const shared: string[] = [];
 	for (const [name, entry] of Object.entries(servers)) {
 		if (!entry || typeof entry !== "object") continue;
-		const { env } = entry;
-		if (!env || typeof env !== "object") continue;
-		const raw = env[CONFIG_ENV];
-		if (typeof raw !== "string") continue;
-		const value = raw.trim();
-		if (value.length === 0) continue;
-		// A server OMP will not launch cannot be this session's identity.
+		// A server OMP will not launch cannot be this session's identity contract.
 		if (disabled.includes(name)) continue;
 		if (entry.enabled === false && !forceEnabled.includes(name)) continue;
 
+		const env = entry.env;
+		const hasConfig = Boolean(env && typeof env === "object" && Object.hasOwn(env, CONFIG_ENV));
+		if (entry.command === MATTERMOST_MCP && !hasConfig) {
+			shared.push(name);
+			continue;
+		}
+		if (!hasConfig) continue;
+
+		const raw = env?.[CONFIG_ENV];
+		if (typeof raw !== "string" || raw.trim().length === 0) {
+			return {
+				ok: false,
+				reason: `${file}: server "${name}" sets ${CONFIG_ENV} to a non-path value; refusing to guess`,
+			};
+		}
+		const value = raw.trim();
 		const literal = literalPath(value);
 		if (!literal.ok) {
 			return { ok: false, reason: `${file}: server "${name}" sets ${CONFIG_ENV}=${value}, ${literal.reason}` };
@@ -219,6 +243,30 @@ export function resolveProjectConfig(cwd: string): Resolution<ConfigChoice> | nu
 		const owners = pinned.get(path);
 		if (owners) owners.push(name);
 		else pinned.set(path, [name]);
+	}
+
+	if (shared.length > 0 && pinned.size > 0) {
+		const pins = [...pinned]
+			.map(([path, names]) => `${names.join(", ")} → ${path}`)
+			.join("; ");
+		return {
+			ok: false,
+			reason:
+				`${file} mixes shared-project server${shared.length === 1 ? "" : "s"} ${shared.map((name) => `"${name}"`).join(", ")} ` +
+				`with pinned ${CONFIG_ENV} (${pins}); refusing to choose which identity contract MCP uses`,
+		};
+	}
+	if (shared.length > 1) {
+		return {
+			ok: false,
+			reason: `${file} has ${shared.length} shared-project Mattermost servers (${shared.map((name) => `"${name}"`).join(", ")}); expected exactly one`,
+		};
+	}
+	if (shared.length === 1) {
+		return {
+			ok: true,
+			value: { mode: "shared", detail: `${file} server "${shared[0]}" (shared-project mode)` },
+		};
 	}
 
 	if (pinned.size === 0) return null;
@@ -235,28 +283,47 @@ export function resolveProjectConfig(cwd: string): Resolution<ConfigChoice> | nu
 	const [path, names] = [...pinned][0];
 	const detail = `${file} server ${names.map((name) => `"${name}"`).join(", ")}`;
 	if (fileMode(path) === null) return { ok: false, reason: `${detail} points ${CONFIG_ENV} at ${path}, which does not exist` };
-	return { ok: true, value: { path, origin: "project", detail } };
+	return { ok: true, value: { mode: "pinned", path, detail } };
 }
 
 /**
- * The identity this session listens as: the environment, the project MCP file,
- * or neither. Disagreement is fatal rather than resolved by precedence —
- * listening as one account while the MCP tools reply as another is worse than
- * not listening at all.
+ * The identity this session listens as. Pinned projects require agreement;
+ * shared projects require the environment and deliberately provide no default.
  */
-export function resolveSessionConfig(env: Env, cwd?: string): Resolution<ConfigChoice> | null {
+export function resolveSessionConfig(env: Env, cwd?: string): SessionConfigResolution | null {
 	const explicit = resolveConfigPath(env);
 	if (explicit && !explicit.ok) return explicit;
 
 	const project = cwd ? resolveProjectConfig(cwd) : null;
 	if (project && !project.ok) return project;
 
+	if (project?.ok && project.value.mode === "shared") {
+		if (!explicit?.ok) {
+			return {
+				ok: false,
+				inactive: true,
+				reason:
+					`${project.value.detail} requires ${CONFIG_ENV}; ` +
+					`launch OMP with ${CONFIG_ENV}=/absolute/path/to/profile.json`,
+			};
+		}
+		return {
+			ok: true,
+			value: {
+				path: explicit.value,
+				origin: "env",
+				detail: `${CONFIG_ENV}, selected for ${project.value.detail}`,
+			},
+		};
+	}
+
 	if (explicit?.ok && project?.ok) {
-		if (explicit.value !== project.value.path) {
+		const pinned = project.value.path as string;
+		if (explicit.value !== pinned) {
 			return {
 				ok: false,
 				reason:
-					`${CONFIG_ENV}=${explicit.value} but ${project.value.detail} pins ${project.value.path}; ` +
+					`${CONFIG_ENV}=${explicit.value} but ${project.value.detail} pins ${pinned}; ` +
 					"refusing to listen as one account while the MCP tools act as another",
 			};
 		}
@@ -266,11 +333,17 @@ export function resolveSessionConfig(env: Env, cwd?: string): Resolution<ConfigC
 		};
 	}
 	if (explicit?.ok) return { ok: true, value: { path: explicit.value, origin: "env", detail: CONFIG_ENV } };
-	return project;
+	if (project?.ok) {
+		return {
+			ok: true,
+			value: { path: project.value.path as string, origin: "project", detail: project.value.detail },
+		};
+	}
+	return null;
 }
 
-/** Why a session with no identity is not watching — never phrased as a fault. */
+/** Why a session outside shared-project mode has no identity. */
 export function inactiveReason(cwd?: string): string {
 	if (!cwd) return `${CONFIG_ENV} is not set and this session has no project directory`;
-	return `${CONFIG_ENV} is not set and no server in ${projectMcpPath(cwd)} pins it`;
+	return `${CONFIG_ENV} is not set and no server in ${projectMcpPath(cwd)} pins it or declares shared-project mode`;
 }

@@ -69,6 +69,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FAKE_CORE = join(HERE, "fake-core.ts");
 const MONITOR = join(HERE, "..", "claude-plugin", "bin", "mattermost-monitor");
 const INSTALLER = join(HERE, "..", "install-project.ts");
+const MCP_WRAPPER = join(HERE, "..", "bin", "mattermost-mcp");
 /** The canonical skill, and the copy the Claude plugin ships. */
 const ROOT_SKILL = join(HERE, "..", "..", "SKILL.md");
 const PLUGIN_SKILL = join(HERE, "..", "claude-plugin", "skills", "mattermost", "SKILL.md");
@@ -99,24 +100,31 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 8_00
 	throw new Error(`timed out waiting for ${label}`);
 }
 
+interface TestIdentity {
+	connection?: string;
+	account?: string;
+	stateDir?: string;
+}
+
 function workspace(name: string): { dir: string; config: string } {
 	const dir = mkdtempSync(join(tmpdir(), `mm-adapter-${name}-`));
 	return { dir, config: agentConfig(dir, "config.json") };
 }
 
 /** A core agent config on disk, so resolution's existence check passes. */
-function agentConfig(dir: string, file: string): string {
+function agentConfig(dir: string, file: string, identity: TestIdentity = {}): string {
 	const config = join(dir, file);
 	writeFileSync(
 		config,
 		JSON.stringify({
 			version: 1,
-			stateDir: join(dir, "state"),
+			stateDir: identity.stateDir ?? join(dir, "state"),
 			connections: [
 				{
-					id: "testconn",
+					id: identity.connection ?? "testconn",
 					url: "https://example.invalid",
 					tokenEnv: "TEST_MM_TOKEN",
+					...(identity.account ? { expectedUserId: identity.account } : {}),
 					channelIds: ["channel1"],
 					allowedBotIds: [],
 					pollIntervalMs: 5000,
@@ -142,6 +150,11 @@ function mcpServer(config: string, extra: Record<string, unknown> = {}): Record<
 		env: { MATTERMOST_AGENT_CONFIG: config },
 		...extra,
 	};
+}
+
+/** The generic entry installed for shared-project identity selection. */
+function sharedMcpServer(): Record<string, unknown> {
+	return { command: MCP_WRAPPER };
 }
 
 function alive(pid: number): boolean {
@@ -170,6 +183,24 @@ function spawnedConfigs(log: string): string[] {
 		.split("\n")
 		.filter((line) => line.length > 0)
 		.map((line) => line.split(" ")[2] ?? "");
+}
+
+interface FakeIdentity {
+	command: string;
+	pid: number;
+	config: string;
+	stateDir: string;
+	connection: string;
+	account: string;
+}
+
+function fakeIdentities(log: string): FakeIdentity[] {
+	if (!existsSync(log)) return [];
+	return readFileSync(log, "utf8")
+		.trim()
+		.split("\n")
+		.filter((line) => line.length > 0)
+		.map((line) => JSON.parse(line) as FakeIdentity);
 }
 
 interface Harness {
@@ -324,6 +355,152 @@ async function projectProfileFailuresAreLoud(): Promise<void> {
 	const started = agreement.watcher.start();
 	check("the same identity from both sources still starts", started.kind === "starting", JSON.stringify(started));
 	await agreement.watcher.stop();
+}
+
+async function sharedProjectSessionsAreIsolated(): Promise<void> {
+	console.log("shared-project mode selects one profile per OMP process in the same directory");
+	const root = mkdtempSync(join(tmpdir(), "mm-adapter-shared-sessions-"));
+	const project = join(root, "worktree");
+	mkdirSync(project);
+	const alphaState = join(root, "alpha-state");
+	const betaState = join(root, "beta-state");
+	const alpha = agentConfig(root, "alpha.json", {
+		connection: "alpha",
+		account: "account-alpha",
+		stateDir: alphaState,
+	});
+	const beta = agentConfig(root, "beta.json", {
+		connection: "beta",
+		account: "account-beta",
+		stateDir: betaState,
+	});
+	const mcpPath = projectMcp(project, { mcpServers: { "mattermost-session": sharedMcpServer() } });
+	const identityLog = join(root, "identities.jsonl");
+
+	const unsetHarness = harness(
+		{ MATTERMOST_AGENT_CONFIG: undefined, FAKE_CORE_IDENTITY_LOG: identityLog },
+		50,
+		project,
+	);
+	const unset = unsetHarness.watcher.start();
+	const unsetDiagnostic =
+		`${mcpPath} server "mattermost-session" (shared-project mode) requires MATTERMOST_AGENT_CONFIG; ` +
+		"launch OMP with MATTERMOST_AGENT_CONFIG=/absolute/path/to/profile.json";
+	check(
+		"an unset shared identity is inactive with the exact launch diagnostic",
+		unset.kind === "inactive" && unset.detail === unsetDiagnostic,
+		JSON.stringify(unset),
+	);
+	check("an unset shared identity starts no watcher", unsetHarness.watcher.pid === null);
+
+	const alphaHarness = harness(
+		{
+			MATTERMOST_AGENT_CONFIG: alpha,
+			FAKE_CORE_CONNECTION: "alpha",
+			FAKE_CORE_IDENTITY_LOG: identityLog,
+		},
+		50,
+		project,
+	);
+	const betaHarness = harness(
+		{
+			MATTERMOST_AGENT_CONFIG: beta,
+			FAKE_CORE_CONNECTION: "beta",
+			FAKE_CORE_IDENTITY_LOG: identityLog,
+		},
+		50,
+		project,
+	);
+	alphaHarness.watcher.start();
+	betaHarness.watcher.start();
+	await Promise.all([
+		waitFor("alpha watcher events", () => alphaHarness.events.length >= 2),
+		waitFor("beta watcher events", () => betaHarness.events.length >= 2),
+	]);
+	check("both watchers run concurrently", alphaHarness.watcher.pid !== null && betaHarness.watcher.pid !== null);
+	check("alpha watcher resolved only alpha's profile", alphaHarness.watcher.config === alpha, String(alphaHarness.watcher.config));
+	check("beta watcher resolved only beta's profile", betaHarness.watcher.config === beta, String(betaHarness.watcher.config));
+	check(
+		"alpha receives no beta watcher events",
+		alphaHarness.events.every((event) => event.connection === "alpha"),
+		JSON.stringify(alphaHarness.events),
+	);
+	check(
+		"beta receives no alpha watcher events",
+		betaHarness.events.every((event) => event.connection === "beta"),
+		JSON.stringify(betaHarness.events),
+	);
+
+	const alphaMcp = spawnSync(MCP_WRAPPER, [], {
+		cwd: project,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			MATTERMOST_AGENT_CLI: FAKE_CORE,
+			MATTERMOST_AGENT_CONFIG: alpha,
+			FAKE_CORE_IDENTITY_LOG: identityLog,
+		},
+	});
+	const betaMcp = spawnSync(MCP_WRAPPER, [], {
+		cwd: project,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			MATTERMOST_AGENT_CLI: FAKE_CORE,
+			MATTERMOST_AGENT_CONFIG: beta,
+			FAKE_CORE_IDENTITY_LOG: identityLog,
+		},
+	});
+	check("both inherited-environment MCP children start", alphaMcp.status === 0 && betaMcp.status === 0);
+
+	await alphaHarness.watcher.stop();
+	await betaHarness.watcher.stop();
+	const identities = fakeIdentities(identityLog);
+	const watcherIdentities = identities.filter((identity) => identity.command === "watch");
+	const mcpIdentities = identities.filter((identity) => identity.command === "mcp");
+	for (const [surface, rows] of [
+		["watcher", watcherIdentities],
+		["MCP", mcpIdentities],
+	] as const) {
+		check(
+			`${surface} alpha keeps its account and state directory`,
+			rows.some(
+				(identity) =>
+					identity.config === alpha &&
+					identity.connection === "alpha" &&
+					identity.account === "account-alpha" &&
+					identity.stateDir === alphaState,
+			),
+			JSON.stringify(rows),
+		);
+		check(
+			`${surface} beta keeps its account and state directory`,
+			rows.some(
+				(identity) =>
+					identity.config === beta &&
+					identity.connection === "beta" &&
+					identity.account === "account-beta" &&
+					identity.stateDir === betaState,
+			),
+			JSON.stringify(rows),
+		);
+	}
+
+	const conflicted = join(root, "conflicted");
+	projectMcp(conflicted, {
+		mcpServers: {
+			"mattermost-session": sharedMcpServer(),
+			"mattermost-pinned": mcpServer(alpha),
+		},
+	});
+	const conflictHarness = harness({ MATTERMOST_AGENT_CONFIG: beta }, 50, conflicted);
+	const conflict = conflictHarness.watcher.start();
+	check(
+		"a shared server beside a pin fails closed instead of starting either identity",
+		conflict.kind === "failed" && conflict.detail.includes("mixes shared-project server"),
+		JSON.stringify(conflict),
+	);
+	check("a conflicting shared contract starts no watcher", conflictHarness.watcher.pid === null);
 }
 
 async function twoEventsOneListener(): Promise<void> {
@@ -706,6 +883,17 @@ async function projectInstaller(): Promise<void> {
 		readFileSync(join(project, ".omp", ".gitignore"), "utf8").includes("/mcp.json"),
 	);
 
+	const pinnedRecord = JSON.parse(
+		readFileSync(join(project, ".omp", "mattermost-agents-install.json"), "utf8"),
+	) as Record<string, unknown>;
+	check(
+		"the install record identifies pinned schema v2 state",
+		pinnedRecord.schema === "mattermost-agents/install-record/2" &&
+			pinnedRecord.mode === "pinned" &&
+			pinnedRecord.profile === config,
+		JSON.stringify(pinnedRecord),
+	);
+
 	const again = runInstaller("--project", project, "--profile", config, "--server-name", "mattermost-fleet-security");
 	check("a second install changes nothing", again.code === 0 && again.stdout.includes("nothing to do"), again.stdout);
 
@@ -781,6 +969,215 @@ async function projectInstaller(): Promise<void> {
 	const symlinked = runInstaller("--project", shared, "--profile", config, "--server-name", "mattermost-fleet-security");
 	check("a symlinked config directory is refused", symlinked.code === 78, `${symlinked.code} ${symlinked.stderr}`);
 	check("and the shared directory is untouched", !existsSync(join(dir, "elsewhere", "mcp.json")));
+}
+
+async function sharedProjectInstaller(): Promise<void> {
+	console.log("install-project.ts: shared mode, migration, idempotency and owned rollback");
+	const { dir, config } = workspace("shared-installer");
+	const project = join(dir, "worktree");
+	const ompDir = join(project, ".omp");
+	mkdirSync(ompDir, { recursive: true });
+	const originalMcp = {
+		mcpServers: { filesystem: { command: "filesystem-server", args: [project] } },
+		metadata: { owner: "project" },
+	};
+	const originalSettings = { extensions: ["/existing/extension.ts"], theme: "dark" };
+	writeFileSync(join(ompDir, "mcp.json"), JSON.stringify(originalMcp, null, 2));
+	writeFileSync(join(ompDir, "settings.json"), JSON.stringify(originalSettings, null, 2));
+	writeFileSync(join(ompDir, ".gitignore"), "keep.me\n");
+
+	const installed = runInstaller(
+		"--project",
+		project,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	check(
+		"shared-project install succeeds and prints the per-session launch requirement",
+		installed.code === 0 && installed.stdout.includes("launch each OMP process with MATTERMOST_AGENT_CONFIG=<profile>"),
+		`${installed.code} ${installed.stdout} ${installed.stderr}`,
+	);
+	const installedMcp = JSON.parse(readFileSync(join(ompDir, "mcp.json"), "utf8")) as {
+		mcpServers: Record<string, { command?: string; env?: unknown }>;
+	};
+	check("shared install preserves unrelated MCP entries", installedMcp.mcpServers.filesystem?.command === "filesystem-server");
+	check(
+		"shared install adds one generic server without an embedded profile",
+		installedMcp.mcpServers["mattermost-session"]?.command === MCP_WRAPPER &&
+			!("env" in installedMcp.mcpServers["mattermost-session"]),
+		JSON.stringify(installedMcp),
+	);
+	const sharedRecord = JSON.parse(
+		readFileSync(join(ompDir, "mattermost-agents-install.json"), "utf8"),
+	) as Record<string, unknown>;
+	check(
+		"shared install record distinguishes mode and contains no profile",
+		sharedRecord.schema === "mattermost-agents/install-record/2" &&
+			sharedRecord.mode === "shared" &&
+			!("profile" in sharedRecord),
+		JSON.stringify(sharedRecord),
+	);
+
+	const again = runInstaller(
+		"--project",
+		project,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	check("shared install is idempotent", again.code === 0 && again.stdout.includes("nothing to do"), again.stdout);
+
+	const rolledBack = runInstaller("--project", project, "--rollback");
+	check("shared rollback succeeds", rolledBack.code === 0, rolledBack.stderr);
+	const afterMcp = JSON.parse(readFileSync(join(ompDir, "mcp.json"), "utf8"));
+	const afterSettings = JSON.parse(readFileSync(join(ompDir, "settings.json"), "utf8"));
+	check("shared rollback preserves unrelated MCP configuration", JSON.stringify(afterMcp) === JSON.stringify(originalMcp));
+	check(
+		"shared rollback preserves unrelated settings",
+		JSON.stringify(afterSettings) === JSON.stringify(originalSettings),
+	);
+	check("shared rollback removes only its ignore lines", readFileSync(join(ompDir, ".gitignore"), "utf8") === "keep.me\n");
+	check("shared rollback removes its install record", !existsSync(join(ompDir, "mattermost-agents-install.json")));
+
+	const dryProject = join(dir, "dry-run");
+	mkdirSync(dryProject);
+	const dryRun = runInstaller(
+		"--project",
+		dryProject,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+		"--dry-run",
+	);
+	check(
+		"shared dry-run reports generic installation without writing",
+		dryRun.code === 0 &&
+			dryRun.stdout.includes("shared-project identity") &&
+			dryRun.stdout.includes("dry run:") &&
+			!existsSync(join(dryProject, ".omp")),
+		`${dryRun.stdout} ${dryRun.stderr}`,
+	);
+
+	const migration = join(dir, "migration");
+	mkdirSync(migration);
+	const pinned = runInstaller(
+		"--project",
+		migration,
+		"--profile",
+		config,
+		"--server-name",
+		"mattermost-session",
+	);
+	check("migration fixture installs pinned mode", pinned.code === 0, pinned.stderr);
+	const migrationRecordPath = join(migration, ".omp", "mattermost-agents-install.json");
+	const legacyRecord = JSON.parse(readFileSync(migrationRecordPath, "utf8")) as Record<string, unknown>;
+	legacyRecord.schema = "mattermost-agents/install-record/1";
+	delete legacyRecord.mode;
+	writeFileSync(migrationRecordPath, JSON.stringify(legacyRecord, null, 2));
+	const upgraded = runInstaller(
+		"--project",
+		migration,
+		"--profile",
+		config,
+		"--server-name",
+		"mattermost-session",
+	);
+	const upgradedRecord = JSON.parse(readFileSync(migrationRecordPath, "utf8")) as Record<string, unknown>;
+	check(
+		"a legacy pinned record upgrades idempotently to schema v2",
+		upgraded.code === 0 &&
+			upgraded.stdout.includes("install-record/1 → mattermost-agents/install-record/2") &&
+			upgradedRecord.schema === "mattermost-agents/install-record/2" &&
+			upgradedRecord.mode === "pinned",
+		`${upgraded.stdout} ${upgraded.stderr} ${JSON.stringify(upgradedRecord)}`,
+	);
+
+	const migrated = runInstaller(
+		"--project",
+		migration,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	const migratedMcp = JSON.parse(readFileSync(join(migration, ".omp", "mcp.json"), "utf8")) as {
+		mcpServers: Record<string, { command?: string; env?: unknown }>;
+	};
+	const migratedRecord = JSON.parse(readFileSync(migrationRecordPath, "utf8")) as Record<string, unknown>;
+	check(
+		"explicit pinned-to-shared migration removes only the owned profile pin",
+		migrated.code === 0 &&
+			migrated.stdout.includes("from pinned to shared-project mode") &&
+			migratedMcp.mcpServers["mattermost-session"]?.command === MCP_WRAPPER &&
+			!("env" in migratedMcp.mcpServers["mattermost-session"]),
+		`${migrated.stdout} ${migrated.stderr} ${JSON.stringify(migratedMcp)}`,
+	);
+	check(
+		"migration records shared mode without retaining the old profile",
+		migratedRecord.mode === "shared" && !("profile" in migratedRecord),
+		JSON.stringify(migratedRecord),
+	);
+	const migratedAgain = runInstaller(
+		"--project",
+		migration,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	check("migrated shared install is idempotent", migratedAgain.code === 0 && migratedAgain.stdout.includes("nothing to do"));
+	const migratedRollback = runInstaller("--project", migration, "--rollback");
+	check(
+		"rollback after migration removes the original owned install",
+		migratedRollback.code === 0 &&
+			!existsSync(join(migration, ".omp", "mcp.json")) &&
+			!existsSync(join(migration, ".omp", "settings.json")) &&
+			!existsSync(migrationRecordPath),
+		`${migratedRollback.stdout} ${migratedRollback.stderr}`,
+	);
+
+	const unowned = join(dir, "unowned-pin");
+	mkdirSync(join(unowned, ".omp"), { recursive: true });
+	writeFileSync(
+		join(unowned, ".omp", "mcp.json"),
+		JSON.stringify({ mcpServers: { "mattermost-session": mcpServer(config) } }, null, 2),
+	);
+	const unownedMigration = runInstaller(
+		"--project",
+		unowned,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	check(
+		"shared mode refuses to migrate a matching but unowned pin",
+		unownedMigration.code === 78 && unownedMigration.stderr.includes("different settings"),
+		`${unownedMigration.code} ${unownedMigration.stderr}`,
+	);
+	check("refused unowned migration writes no extension", !existsSync(join(unowned, ".omp", "settings.json")));
+
+	const changed = join(dir, "changed-pin");
+	mkdirSync(changed);
+	runInstaller("--project", changed, "--profile", config, "--server-name", "mattermost-session");
+	const changedMcpPath = join(changed, ".omp", "mcp.json");
+	const changedMcp = JSON.parse(readFileSync(changedMcpPath, "utf8")) as {
+		mcpServers: Record<string, unknown>;
+	};
+	changedMcp.mcpServers.unrelated = { command: "unrelated" };
+	writeFileSync(changedMcpPath, JSON.stringify(changedMcp, null, 2));
+	const beforeRefusal = readFileSync(changedMcpPath, "utf8");
+	const changedMigration = runInstaller(
+		"--project",
+		changed,
+		"--shared-project",
+		"--server-name",
+		"mattermost-session",
+	);
+	check(
+		"migration refuses an MCP file changed after the pinned install",
+		changedMigration.code === 78 && changedMigration.stderr.includes("changed since the pinned install"),
+		`${changedMigration.code} ${changedMigration.stderr}`,
+	);
+	check("refused migration leaves the changed MCP file untouched", readFileSync(changedMcpPath, "utf8") === beforeRefusal);
 }
 
 /**
@@ -1608,6 +2005,7 @@ for (const scenario of [
 	identityIsExplicit,
 	projectProfileActivates,
 	projectProfileFailuresAreLoud,
+	sharedProjectSessionsAreIsolated,
 	twoEventsOneListener,
 	terminalExitDoesNotLoop,
 	crashRestarts,
@@ -1617,6 +2015,7 @@ for (const scenario of [
 	freshContextsAreOneSession,
 	unidentifiedSessionGetsNoListener,
 	projectInstaller,
+	sharedProjectInstaller,
 	pluginSkillMatchesRoot,
 	pluginWrapper,
 	footerIsOneHonestLine,

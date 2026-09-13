@@ -11,6 +11,8 @@
  *                                    later runs: stream.
  *   FAKE_CORE_SPAWN_LOG=<path>     — one "<command> <pid> <config>" line per
  *                                    invocation.
+ *   FAKE_CORE_IDENTITY_LOG=<path>  — one JSON line with the selected profile's
+ *                                    connection, account and stateDir.
  *   FAKE_CORE_SIGTERM_LOG=<path>   — one line appended when SIGTERM lands.
  */
 
@@ -29,11 +31,33 @@ if (!config || !existsSync(config)) {
 const spawnLog = process.env.FAKE_CORE_SPAWN_LOG;
 if (spawnLog) appendFileSync(spawnLog, `${command ?? "?"} ${process.pid} ${config}\n`);
 
+const identityLog = process.env.FAKE_CORE_IDENTITY_LOG;
+if (identityLog) {
+	const profile = JSON.parse(await Bun.file(config).text()) as {
+		stateDir?: unknown;
+		connections?: { id?: unknown; expectedUserId?: unknown }[];
+	};
+	const connection = profile.connections?.[0];
+	appendFileSync(
+		identityLog,
+		`${JSON.stringify({
+			command,
+			pid: process.pid,
+			config,
+			stateDir: profile.stateDir,
+			connection: connection?.id,
+			account: connection?.expectedUserId,
+		})}\n`,
+	);
+}
+
 if (command === "ack") {
 	const ackLog = process.env.FAKE_CORE_ACK_LOG;
 	if (ackLog) appendFileSync(ackLog, `${argv.join(" ")}\n`);
 	process.exit(0);
 }
+
+if (command === "mcp") process.exit(0);
 
 if (command !== "watch") {
 	process.stderr.write(`mattermost-agent: config-error: unsupported command ${command}\n`);
