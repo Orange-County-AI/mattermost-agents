@@ -43,14 +43,33 @@ export interface MattermostEvent {
 
 /**
  * Exit codes fixed by the core owner: 0 clean, 2 config error, 3 another live
- * watcher holds the lock, 4 auth failure, 1 unexpected. 2/3/4 are terminal —
- * restarting would only race the other consumer or repeat the same failure.
+ * watcher holds the lock, 4 auth failure, 1 unexpected.
+ *
+ * 2 and 4 are terminal: retrying repeats a failure only a human can fix.
+ *
+ * 3 is NOT, and treating it as one is how a session ends up deaf for its whole
+ * life. A lock holder is a live listener *right now*, which is the working
+ * case rather than a fault — and it is very often a predecessor that is still
+ * shutting down, so the session that started a second too early is the one
+ * that should end up listening. This adapter therefore waits for the lock and
+ * takes over the moment it is released, rather than exiting and staying mute.
  */
 const TERMINAL_EXITS: Record<number, string> = {
 	2: "config error",
-	3: "another watcher already holds this config's lock",
 	4: "authentication failed",
 };
+/** Another live watcher owns this identity. Wait it out; see `LOCK_WAIT_*`. */
+const LOCK_EXIT = 3;
+/**
+ * How long to wait before testing a lock somebody else holds again: doubling
+ * from this, capped at `LOCK_WAIT_CAP_MS`, and never given up on. What decides
+ * the wait is how long a predecessor takes to exit, not a count, so the only
+ * cost of waiting longer is that much extra deafness at the takeover — two
+ * minutes is short enough to be unnoticeable and long enough that a standby is
+ * not spawning a process a second for hours.
+ */
+const LOCK_WAIT_BASE_MS = 30_000;
+const LOCK_WAIT_CAP_MS = 120_000;
 
 const RESTART_BASE_MS = 1_000;
 const RESTART_CAP_MS = 30_000;
@@ -66,6 +85,12 @@ export type WatcherStatus =
 	| { kind: "starting" }
 	| { kind: "ready"; pid: number; connections: number }
 	| { kind: "restarting"; attempt: number; delayMs: number }
+	/**
+	 * Another live listener owns this identity and this session is next in
+	 * line. Not a failure and not `restarting`: nothing here crashed, and the
+	 * wait ends when somebody else stops. Never gives up.
+	 */
+	| { kind: "waiting"; attempt: number; delayMs: number }
 	| { kind: "failed"; detail: string }
 	| { kind: "stopped" };
 
@@ -83,6 +108,9 @@ export interface WatcherOptions {
 	onDiagnostic(line: string): void;
 	/** Test seam. */
 	restartBaseMs?: number;
+	/** Test seam for the lock wait, which is minutes in production. */
+	lockWaitBaseMs?: number;
+	lockWaitCapMs?: number;
 }
 
 function parseEvent(line: string): MattermostEvent | null {
@@ -126,9 +154,12 @@ export class CoreWatcher {
 	#child: ChildProcess | null = null;
 	#status: WatcherStatus = { kind: "stopped" };
 	#restarts = 0;
+	/** Consecutive lock-held exits: how many times this session has been next in line. */
+	#waits = 0;
 	#startedAt = 0;
 	#stopping = false;
-	#restartTimer: NodeJS.Timeout | undefined;
+	/** A respawn is pending — after a crash or after waiting for somebody's lock. */
+	#retryTimer: NodeJS.Timeout | undefined;
 	#killTimer: NodeJS.Timeout | undefined;
 	#diagnostics: string[] = [];
 	#command: CoreCommand | null = null;
@@ -172,9 +203,10 @@ export class CoreWatcher {
 	 * broken or conflicting.
 	 */
 	start(): WatcherStatus {
-		if (this.#child || this.#restartTimer) return this.#status;
+		if (this.#child || this.#retryTimer) return this.#status;
 		this.#stopping = false;
 		this.#restarts = 0;
+		this.#waits = 0;
 
 		const config = resolveSessionConfig(this.#options.env, this.#options.cwd);
 		if (config === null) {
@@ -202,8 +234,8 @@ export class CoreWatcher {
 	 */
 	async stop(graceMs = 5_000): Promise<void> {
 		this.#stopping = true;
-		clearTimeout(this.#restartTimer);
-		this.#restartTimer = undefined;
+		clearTimeout(this.#retryTimer);
+		this.#retryTimer = undefined;
 		const child = this.#child;
 		if (!child || child.exitCode !== null || child.signalCode !== null) {
 			this.#child = null;
@@ -306,6 +338,29 @@ export class CoreWatcher {
 
 		const uptime = Date.now() - this.#startedAt;
 		const how = code === null ? `signal ${signal}` : `exit ${code}`;
+		// A child that survived this long was working; neither budget carries over
+		// into the next one, so a session that listened for an hour and then lost
+		// its lock is not treated as a crash-looper.
+		if (uptime >= HEALTHY_UPTIME_MS) {
+			this.#restarts = 0;
+			this.#waits = 0;
+		}
+
+		// Somebody else is listening. That is the working case, and it is usually
+		// a predecessor still shutting down, so this session waits its turn
+		// instead of giving up: the session that was launched last is the one
+		// that should end up listening, however the two overlap.
+		if (code === LOCK_EXIT) {
+			this.#waits += 1;
+			const base = this.#options.lockWaitBaseMs ?? LOCK_WAIT_BASE_MS;
+			const cap = this.#options.lockWaitCapMs ?? LOCK_WAIT_CAP_MS;
+			const delayMs = Math.min(base * 2 ** (this.#waits - 1), cap);
+			this.#note(`lock held by another listener; checking again in ${delayMs}ms (check ${this.#waits})`);
+			this.#setStatus({ kind: "waiting", attempt: this.#waits, delayMs });
+			this.#schedule(delayMs);
+			return;
+		}
+
 		const terminal = code === null ? undefined : TERMINAL_EXITS[code];
 		if (terminal) {
 			this.#note(`core stopped: ${terminal} (${how})`);
@@ -313,7 +368,6 @@ export class CoreWatcher {
 			return;
 		}
 
-		if (uptime >= HEALTHY_UPTIME_MS) this.#restarts = 0;
 		this.#restarts += 1;
 		if (this.#restarts > MAX_RESTARTS) {
 			const detail = `core exited ${MAX_RESTARTS + 1} times (last: ${how}); giving up`;
@@ -326,12 +380,17 @@ export class CoreWatcher {
 		const delayMs = Math.min(base * 2 ** (this.#restarts - 1), RESTART_CAP_MS);
 		this.#note(`core ${how}; restarting in ${delayMs}ms (attempt ${this.#restarts})`);
 		this.#setStatus({ kind: "restarting", attempt: this.#restarts, delayMs });
-		this.#restartTimer = setTimeout(() => {
-			this.#restartTimer = undefined;
+		this.#schedule(delayMs);
+	}
+
+	/** Arm one respawn. Unref'd, so a pending wait never holds the host open. */
+	#schedule(delayMs: number): void {
+		this.#retryTimer = setTimeout(() => {
+			this.#retryTimer = undefined;
 			if (this.#stopping) return;
 			this.#spawnChild();
 		}, delayMs);
-		this.#restartTimer.unref?.();
+		this.#retryTimer.unref?.();
 	}
 
 	#note(line: string): void {

@@ -334,6 +334,9 @@ Three cases where starting a listener is the wrong move:
   riding.
 - **`lock-held`, exit `3`, means somebody else is already listening** for this
   identity. That is the working case, not a failure — never start a second one.
+  In OMP the adapter already handles it: it waits its turn and takes the
+  listener over the moment the other one stops, so nothing needs doing. In
+  Claude Code the monitor exits and stays exited; leave it alone.
 - **`auth-error` / `identity-error`** needs a human with a credential; no
   number of restarts fixes a revoked token. Say what it says.
 

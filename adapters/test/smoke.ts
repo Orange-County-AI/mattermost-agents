@@ -14,8 +14,9 @@
  *     undelivered mail with it, so nothing leaks into the next session,
  *   - repeated wakeups: two events on one live listener produce two separate
  *     native notifications, waking the model once,
- *   - lifecycle: a terminal exit does not restart-loop, a crash does, and
- *     stopping leaves no orphan.
+ *   - lifecycle: a terminal exit does not restart-loop, a lock held by a peer
+ *     on its way out is waited out and taken over, a crash does restart-loop,
+ *     and stopping leaves no orphan.
  *   - the footer: one rendered line for every channel integration in the
  *     process, labelled with each one's brand glyph, naming the identities,
  *     always marking a listener that is not listening, and refusing a status
@@ -75,6 +76,12 @@ const ROOT_SKILL = join(HERE, "..", "..", "SKILL.md");
 const PLUGIN_SKILL = join(HERE, "..", "claude-plugin", "skills", "mattermost", "SKILL.md");
 
 let failures = 0;
+
+/**
+ * The production lock wait is minutes long by design; every test that exercises
+ * it drives the same clock at test speed through the watcher's seams.
+ */
+const LOCK_WAIT_TEST_CAP_MS = 400;
 
 function check(label: string, condition: boolean, detail?: string): void {
 	if (condition) {
@@ -213,6 +220,8 @@ function harness(
 	env: Record<string, string | undefined>,
 	restartBaseMs = 50,
 	cwd?: string,
+	lockWaitBaseMs = restartBaseMs,
+	lockWaitCapMs = LOCK_WAIT_TEST_CAP_MS,
 ): Harness {
 	const events: MattermostEvent[] = [];
 	const statuses: WatcherStatus[] = [];
@@ -223,6 +232,8 @@ function harness(
 		onStatus: (status) => statuses.push(status),
 		onDiagnostic: () => {},
 		restartBaseMs,
+		lockWaitBaseMs,
+		lockWaitCapMs,
 	});
 	return { watcher, events, statuses };
 }
@@ -521,12 +532,12 @@ async function twoEventsOneListener(): Promise<void> {
 }
 
 async function terminalExitDoesNotLoop(): Promise<void> {
-	console.log("terminal exit (lock held by another consumer) does not restart-loop");
-	const { dir, config } = workspace("lock");
+	console.log("a terminal exit (auth refused) does not restart-loop");
+	const { dir, config } = workspace("auth");
 	const spawnLog = join(dir, "spawns.log");
 	const { watcher, statuses } = harness({
 		MATTERMOST_AGENT_CONFIG: config,
-		FAKE_CORE_MODE: "lock",
+		FAKE_CORE_MODE: "auth",
 		FAKE_CORE_SPAWN_LOG: spawnLog,
 	});
 	watcher.start();
@@ -534,11 +545,71 @@ async function terminalExitDoesNotLoop(): Promise<void> {
 	await sleep(400);
 	check("spawned exactly once", spawnedPids(spawnLog).length === 1);
 	check(
-		"failure names the lock holder",
-		statuses.some((status) => status.kind === "failed" && status.detail.includes("lock")),
+		"failure names what only a human can fix",
+		statuses.some((status) => status.kind === "failed" && status.detail.includes("authentication")),
 	);
 	check("no restart was scheduled", !statuses.some((status) => status.kind === "restarting"));
 	await watcher.stop();
+}
+
+/**
+ * The lock case, which is not a failure. Exit 3 means a live listener owns this
+ * identity — very often a predecessor that is still shutting down — so the
+ * session that was launched last is the one that should end up listening. It
+ * used to die here instead: the newest session stayed deaf for its whole life,
+ * with nothing in the footer and nothing in `status` to say so.
+ */
+async function lockHeldWaitsForTheHolder(): Promise<void> {
+	console.log("a lock held by a peer on its way out is waited out, then taken over");
+	const { dir, config } = workspace("lock-takeover");
+	const spawnLog = join(dir, "spawns.log");
+	const { watcher, events, statuses } = harness({
+		MATTERMOST_AGENT_CONFIG: config,
+		FAKE_CORE_MODE: "lock-once",
+		FAKE_CORE_SPAWN_LOG: spawnLog,
+	});
+	check("the first attempt reports starting, not failed", watcher.start().kind === "starting");
+	await waitFor("a waiting status", () => statuses.some((status) => status.kind === "waiting"));
+	const first = statuses.find((status) => status.kind === "waiting");
+	check(
+		"waiting is its own state: attempt 1, one base interval, no failure",
+		first?.kind === "waiting" &&
+			first.attempt === 1 &&
+			first.delayMs === 50 &&
+			!statuses.some((status) => status.kind === "failed"),
+		JSON.stringify(statuses),
+	);
+	await waitFor("the takeover", () => watcher.status.kind === "ready");
+	check("two spawns: the refused one, then the one that took over", spawnedPids(spawnLog).length === 2);
+	await waitFor("delivery after the takeover", () => events.length >= 1);
+	await watcher.stop();
+
+	// A peer that never leaves. Seven checks is one past `MAX_RESTARTS`: what
+	// must not end this wait is a crash budget, and only the operator stops it.
+	const never = workspace("lock-forever");
+	const neverLog = join(never.dir, "spawns.log");
+	const held = harness({
+		MATTERMOST_AGENT_CONFIG: never.config,
+		FAKE_CORE_MODE: "lock",
+		FAKE_CORE_SPAWN_LOG: neverLog,
+	});
+	held.watcher.start();
+	await waitFor(
+		"seven lock checks",
+		() => held.statuses.filter((status) => status.kind === "waiting").length >= 7,
+		20_000,
+	);
+	const delays = held.statuses
+		.filter((status) => status.kind === "waiting")
+		.map((status) => (status.kind === "waiting" ? status.delayMs : 0));
+	check("the wait doubles, then holds its cap", delays.join(",") === "50,100,200,400,400,400,400", delays.join(","));
+	check(
+		"a lock that is never released leaves it next in line, not failed",
+		held.watcher.status.kind === "waiting" && !held.statuses.some((status) => status.kind === "failed"),
+		JSON.stringify(held.watcher.status),
+	);
+	await held.watcher.stop();
+	check("stopping a waiting session spawns nothing more", spawnedPids(neverLog).length === 7, `${spawnedPids(neverLog).length}`);
 }
 
 async function crashRestarts(): Promise<void> {
@@ -2008,6 +2079,7 @@ for (const scenario of [
 	sharedProjectSessionsAreIsolated,
 	twoEventsOneListener,
 	terminalExitDoesNotLoop,
+	lockHeldWaitsForTheHolder,
 	crashRestarts,
 	ompDeliveryAndIsolation,
 	envelopeIsTaggedAndAuthorityIsBySender,

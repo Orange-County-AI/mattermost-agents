@@ -152,6 +152,8 @@ function describe(status: WatcherStatus): string {
 			return `watching ${status.connections} connection${status.connections === 1 ? "" : "s"} (pid ${status.pid})`;
 		case "restarting":
 			return `restarting in ${status.delayMs}ms (attempt ${status.attempt})`;
+		case "waiting":
+			return `waiting for another listener to release this identity (check ${status.attempt}, next in ${status.delayMs}ms)`;
 		case "failed":
 			return `failed: ${status.detail}`;
 		case "stopped":
@@ -269,6 +271,9 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 				return "failed";
 			case "starting":
 			case "restarting":
+			// Waiting for somebody else's lock is not listening either, and the
+			// marker says so until this session actually owns the identity.
+			case "waiting":
 				return "starting";
 			// inactive/stopped claim no footer space: nothing is watching, and
 			// a segment for a listener that does not exist is a lie.

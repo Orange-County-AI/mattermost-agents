@@ -6,7 +6,10 @@
  * Behaviour is driven by env so one binary can play every scenario:
  *   FAKE_CORE_MODE=stream (default) — ready, then FAKE_CORE_EVENTS events, then
  *                                     idle until SIGTERM (exit 0).
- *   FAKE_CORE_MODE=lock            — lock-held token, exit 3.
+ *   FAKE_CORE_MODE=lock            — lock-held token, exit 3, every run.
+ *   FAKE_CORE_MODE=lock-once       — first run: lock-held token, exit 3;
+ *                                    later runs: stream.
+ *   FAKE_CORE_MODE=auth            — auth-error token, exit 4.
  *   FAKE_CORE_MODE=crash-once      — first run: one event then exit 1;
  *                                    later runs: stream.
  *   FAKE_CORE_SPAWN_LOG=<path>     — one "<command> <pid> <config>" line per
@@ -66,11 +69,19 @@ if (command !== "watch") {
 
 const mode = process.env.FAKE_CORE_MODE ?? "stream";
 
-if (mode === "lock") {
-	process.stderr.write(
-		`mattermost-agent: lock-held: pid=4242 host=test scope=${config}\n`,
-	);
-	process.exit(3);
+if (mode === "lock" || mode === "lock-once") {
+	const marker = `${config}.locked`;
+	const held = mode === "lock" || !existsSync(marker);
+	if (held) {
+		if (mode === "lock-once") writeFileSync(marker, "1");
+		process.stderr.write(`mattermost-agent: lock-held: pid=4242 host=test scope=${config}\n`);
+		process.exit(3);
+	}
+}
+
+if (mode === "auth") {
+	process.stderr.write("mattermost-agent: auth-error: 401 Unauthorized\n");
+	process.exit(4);
 }
 
 let crashThisRun = false;

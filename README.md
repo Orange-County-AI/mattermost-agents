@@ -173,6 +173,20 @@ session preserves the conversation. Once loaded, `/mattermost status` reports
 the listener's state, the config it resolved, where that identity came from,
 and the last few diagnostics; `/mattermost start|stop|restart` control it.
 
+**A session that starts while another one is already listening waits its turn
+instead of dying.** A second `watch` on one profile exits `3`, which is the
+working case rather than a fault — and the usual reason for it is a predecessor
+that is still shutting down. Treating that as fatal is how a session launched a
+second too early ends up deaf for its whole life, with nothing in the footer to
+say so, so the adapter waits: it reports `waiting` rather than `failed`,
+re-checks on a doubling interval capped at two minutes, and takes the listener
+over the moment the lock is released. The session launched last is the one that
+ends up listening, however the two overlap. Nothing here is a crash — the wait
+never counts against the restart budget and never expires — and `/mattermost
+status` names which check it is on. A genuinely unfixable exit is still
+terminal: `2` (config) and `4` (auth) fail at once, because retrying cannot fix
+either.
+
 The extension delivers messages and owns `/mattermost`; it ships no skill of
 its own. Give the agent the operating rules by installing this repository's
 root `SKILL.md` wherever that harness loads skills from—copy it, or symlink it
@@ -635,7 +649,10 @@ each other's events.
 - **One watcher per profile.** A heartbeat lock enforces it; a second `watch`
   on the same profile exits `3` and names the holder. Do not run a second
   listener for the same profile — the harness adapters already run one, so
-  `watch` by hand is for debugging or for a harness that has no monitor.
+  `watch` by hand is for debugging or for a harness that has no monitor. The
+  OMP adapter takes exit `3` as "wait your turn": it re-checks until the lock is
+  free and then takes over, so a session started while a predecessor was still
+  shutting down ends up listening rather than mute.
 - **At-least-once delivery.** An event is committed before it is printed, so a
   crash re-delivers rather than loses; a re-delivery is flagged
   `replayed: true`. Ignore an `event_id` you have already handled.
