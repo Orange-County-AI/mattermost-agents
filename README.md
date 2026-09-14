@@ -173,6 +173,22 @@ session preserves the conversation. Once loaded, `/mattermost status` reports
 the listener's state, the config it resolved, where that identity came from,
 and the last few diagnostics; `/mattermost start|stop|restart` control it.
 
+**The install path is live for every session on the host, so land changes
+whole.** OMP imports the extension file it finds at session start, and a load
+that fails is reported exactly once — `Failed to load extension: N errors
+building …/watcher.ts` — with no retry, no `/reload-plugins` recovery (the
+factory never ran, so there is nothing to reload) and no `/mattermost` command
+in that session to repair it with. The failure is silent from every other
+angle: the footer has no segment, `status` shows nothing, and only that one log
+line says why. So edit a checkout that other sessions share *atomically* —
+commit and `git pull`, or any whole-file replacement — and never edit the
+installed file in place: a multi-step edit walks the file through intermediate
+states, and a session starting mid-edit loads whatever is on disk at that
+instant and stays unreachable for the rest of its life. Measured on
+ws-52labs, 2026-09-14: a session started 7s into an edit sequence, got
+`6 errors building watcher.ts?mtime=…`, and ran with no listener, no
+`/mattermost`, and a perfectly ordinary-looking footer.
+
 **A session that starts while another one is already listening waits its turn
 instead of dying.** A second `watch` on one profile exits `3`, which is the
 working case rather than a fault — and the usual reason for it is a predecessor
