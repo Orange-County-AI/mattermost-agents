@@ -1,6 +1,6 @@
 {
   "name": "mattermost-agents-omp-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Delivers Mattermost messages into an OMP session by supervising the mattermost-agents core CLI.",

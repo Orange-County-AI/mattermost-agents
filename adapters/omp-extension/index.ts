@@ -16,8 +16,10 @@
  * no exported variables and no extra flags — and a different working directory
  * is a different identity, resolved again rather than inherited.
  *
- * Messages arrive as hidden `nextTurn` custom messages, so a live turn and a
- * half-typed prompt both survive the notification. Reading settles nothing:
+ * A batch arrives as ONE `aside` custom message, the mode that reaches a
+ * session that is already working: it lands at the running turn's next step
+ * boundary, or wakes a turn when there is none, without the user pressing a
+ * key and without consuming a half-typed prompt. Reading settles nothing:
  * replying and acking are explicit model actions through the `mattermost` MCP
  * server, which wraps the same core CLI.
  *
@@ -118,7 +120,7 @@ interface CustomMessage {
 }
 
 interface SendOptions {
-	deliverAs?: "steer" | "followUp" | "nextTurn";
+	deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 	triggerTurn?: boolean;
 }
 
@@ -217,17 +219,20 @@ function formatEvent(event: MattermostEvent): string {
 }
 
 /**
- * One delivered turn's worth of content: a single root element, so every byte
- * that reaches the session is inside a tag. The guidance rides along with the
- * event that wakes the model, which is the last of a coalesced batch.
+ * One delivered batch's worth of content: a single root element, so every byte
+ * that reaches the session is inside a tag, and the whole coalesced batch
+ * travels as ONE message. It is one message because OMP drops concurrent
+ * `aside` sends: the first starts the turn and the rest are refused by the
+ * session's own busy check, silently. The guidance closes the element, after
+ * every event it applies to.
  *
  * Exported for the adapter smoke test: what this returns is injected verbatim
  * into a session, so it is worth asserting directly rather than through a
  * mocked host.
  */
-export function formatDelivery(event: MattermostEvent, withGuidance: boolean): string {
-	const parts = [formatEvent(event)];
-	if (withGuidance) parts.push(`<mattermost-guidance>\n${GUIDANCE}\n</mattermost-guidance>`);
+export function formatDelivery(events: MattermostEvent[]): string {
+	const parts = events.map(formatEvent);
+	parts.push(`<mattermost-guidance>\n${GUIDANCE}\n</mattermost-guidance>`);
 	return `<mattermost-delivery>\n${parts.join("\n")}\n</mattermost-delivery>`;
 }
 
@@ -394,24 +399,29 @@ export default function mattermostAdapter(pi: ExtensionApi): void {
 		if (!target || queue.length === 0) return;
 		const batch = queue;
 		queue = [];
-		batch.forEach((event, index) => {
-			const isLast = index === batch.length - 1;
-			try {
-				pi.sendMessage(
-					{
-						customType: CUSTOM_TYPE,
-						content: formatDelivery(event, isLast),
-						details: event,
-						display: true,
-					},
-					// nextTurn keeps a live turn and the user's editor intact; only the
-					// last message of a batch wakes the model, so a burst costs one turn.
-					{ deliverAs: "nextTurn", triggerTurn: isLast },
-				);
-			} catch (error) {
-				pi.logger?.warn?.("mattermost: delivery failed", { error: String(error) });
-			}
-		});
+		try {
+			pi.sendMessage(
+				{
+					customType: CUSTOM_TYPE,
+					content: formatDelivery(batch),
+					details: { events: batch },
+					display: true,
+				},
+				// `aside` is the one mode that reaches a BUSY session: the batch is
+				// injected at the running turn's next step boundary, or — when the
+				// turn is already on its last step — flushed the moment it ends, and
+				// a turn starts for it when the session is idle. None of that needs
+				// the user to touch the keyboard, which is what `nextTurn` waited
+				// for, and none of it discards a half-typed prompt.
+				//
+				// `triggerTurn` is the fallback for a host too old to know `aside`:
+				// there it steers a live turn and wakes an idle one. A host that
+				// knows `aside` ignores it.
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		} catch (error) {
+			pi.logger?.warn?.("mattermost: delivery failed", { error: String(error) });
+		}
 		// This batch is new unanswered mail: what a pending count reports moved.
 		refresh();
 	};

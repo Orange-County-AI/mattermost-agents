@@ -208,6 +208,14 @@ its own. Give the agent the operating rules by installing this repository's
 root `SKILL.md` wherever that harness loads skills from—copy it, or symlink it
 if your loader follows links. It is the canonical text for both harnesses.
 
+**Mail interrupts a working session.** A batch of events arrives as one
+`aside` custom message: OMP injects it at the running turn's next step
+boundary, flushes it the moment a turn ends if it arrived on the turn's last
+step, and starts a turn for it when the session is idle. Nobody has to press a
+key for it to appear, and a half-typed prompt in the editor is left alone. The
+whole coalesced batch travels as a single message because OMP drops concurrent
+`aside` sends — the first starts the turn and the rest are refused silently.
+
 #### What the footer shows
 
 One line, whatever else is loaded. OMP renders one footer line per status key
