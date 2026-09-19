@@ -2,17 +2,25 @@
 # Shared resolution for the adapter wrappers: which bun, which core CLI, which
 # config. Sourced, never executed. Sets RUNNER (may be empty), CLI, CONFIG.
 #
-#   config : $MATTERMOST_AGENT_CONFIG only. Unset means this machine is not a
+#   config : the first argument when it is non-empty, else
+#            $MATTERMOST_AGENT_CONFIG. Neither set means this machine is not a
 #            Mattermost consumer. Nothing is probed out of $HOME or the
 #            checkout: a guessed config would make the adapter start reading
 #            somebody else's inbox.
 #   CLI    : $MATTERMOST_AGENT_CLI, else <repo>/src/agent/cli.ts
 #   bun    : $MATTERMOST_AGENT_BUN, else `bun` on PATH
 #
-# The OMP extension additionally accepts a profile pinned by the project's own
-# `.omp/mcp.json` (see adapters/omp-extension/locate.ts); these wrappers do not,
-# because they run with no project directory of their own. No silent fallbacks:
-# an unresolvable runtime or a broken config makes the wrapper fail visibly.
+# The argument exists for the monitor declaration in
+# adapters/plugin/monitors/monitors.json, which writes the identity into the
+# command as "${MATTERMOST_AGENT_CONFIG}". That is not a longer way of reading
+# the environment: it states in the manifest which variable this listener is
+# about, so omp withholds the monitor on a machine where that variable is unset
+# instead of starting a command that exits 78 in every session. An empty
+# argument falls back to the environment rather than failing, because Claude
+# Code substitutes an unset variable with nothing and still runs the command.
+#
+# No silent fallbacks beyond that: an unresolvable runtime or a broken config
+# makes the wrapper fail visibly.
 
 # EX_CONFIG: not set up here, or set up wrong.
 MATTERMOST_EX_CONFIG=78
@@ -24,6 +32,7 @@ mattermost_fail() {
 
 mattermost_resolve() {
 	# $1: absolute, symlink-resolved path of the calling wrapper.
+	# $2: config path from the caller, which may be empty.
 	CLI=${MATTERMOST_AGENT_CLI:-$(cd "$(dirname "$1")/../.." && pwd)/src/agent/cli.ts}
 	[ -f "$CLI" ] || mattermost_fail "core CLI missing at $CLI (set MATTERMOST_AGENT_CLI)"
 
@@ -40,10 +49,11 @@ mattermost_resolve() {
 		;;
 	esac
 
-	[ -n "${MATTERMOST_AGENT_CONFIG:-}" ] ||
+	CONFIG=${2:-}
+	[ -n "$CONFIG" ] || CONFIG=${MATTERMOST_AGENT_CONFIG:-}
+	[ -n "$CONFIG" ] ||
 		mattermost_fail "MATTERMOST_AGENT_CONFIG is not set: this session is not a Mattermost consumer"
-	CONFIG=$MATTERMOST_AGENT_CONFIG
-	[ -f "$CONFIG" ] || mattermost_fail "MATTERMOST_AGENT_CONFIG=$CONFIG does not exist"
+	[ -f "$CONFIG" ] || mattermost_fail "config $CONFIG does not exist"
 }
 
 mattermost_exec() {

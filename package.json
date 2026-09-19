@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "agent": "bun run src/agent/cli.ts",
-    "skill:sync": "cp SKILL.md adapters/claude-plugin/skills/mattermost/SKILL.md",
+    "skill:sync": "cp SKILL.md adapters/plugin/skills/mattermost/SKILL.md",
     "test": "bun test"
   },
   "dependencies": {

@@ -6,10 +6,11 @@ creates and joins channels, and DMs another agent — with durable state,
 explicit acking and idempotent writes, so nothing is silently lost and nothing
 is silently said twice.
 
-Two harnesses are wired up today: an **OMP extension** that delivers messages
-into a live session, and a **Claude Code** background monitor plus skill. Both
-are thin: they only launch the core CLI, which owns polling, reconnects,
-persistence, redelivery and acking.
+Both harnesses are wired through **one plugin directory** carrying **one
+background monitor declaration**: Claude Code reads it natively, and omp reads
+the same directory through the `omp-monitor` extension. Both stay thin because
+neither delivers anything itself — they only launch the core CLI, which owns
+polling, reconnects, persistence, redelivery and acking.
 
 There is no license file in this repository, so no licence is granted or
 implied.
@@ -74,7 +75,10 @@ is the convention used below — and `chmod 600` it.
 | `operatorUserIds` | your own account(s), by Mattermost user id. A post from one of these arrives as `sender_role="operator"`: it MAY contain instructions and the agent acts on them with its normal judgement. Per connection, because the same human is a different user id on every server. |
 | `automationUserIds` | automation accounts you trust the same way — schedulers, tick loops, CI. They arrive as `sender_role="automation"`. Separate from `operatorUserIds` so the agent can tell a robot from you, and so revoking one never touches the other. |
 | `pollIntervalMs` | REST sweep interval, 1000–600000. Default 5000. |
-| `status` | optional, read only by the OMP extension: what its segment of the footer line shows. `{ "fields": [...], "style": "compact" \| "verbose", "label": "glyph" \| "text" \| "none", "glyph": "…" }`, where `fields` is any of `label`, `connection` (the connection id), `user` (the account the credential authenticates as) and `count` (unanswered events). Default `{"fields": ["label", "connection", "user"], "style": "compact", "label": "glyph"}` — the brand glyph and `connection/user`, no count; `["connection"]` shows the connection alone and `["user"]` the account alone. `label` says which form the label takes: `glyph` is the Mattermost logo (`dev-mattermost`, U+E927), `text` is `mm` (`mattermost` on a verbose line), `none` is no label; a `fields` list without `label` renders none of them. `glyph` replaces that logo with any string of one or two terminal columns — for a font that does not have U+E927. Three things are NOT fields and cannot be switched off: a connection nothing is listening to is always named with its state (`retrying`, `stale`, `absent`, `stopped`); so is one whose credential was refused (`auth`) or whose config is broken (`config`); and so is one whose watcher lock is held by a live process outside this session (`!elsewhere#PID`). A block this build does not understand is REFUSED, loudly — the session gets an error notification, `/mattermost status` says so, and the line falls back to the default rather than rendering nothing. |
+
+A `status` block in an existing profile is ignored rather than rejected: it
+configured a footer segment for the retired OMP extension, and core's config
+schema never knew the key.
 
 Export the token under the name the profile gives, and prove the identity
 before wiring anything into a harness:
@@ -94,9 +98,82 @@ stops the agent instead of impersonating someone.
 
 ## 2. Wire it into a harness
 
+Both harnesses read the same directory. `adapters/plugin/` is one plugin: the
+monitor declaration in `monitors/monitors.json`, the plugin manifest each
+harness looks for (Claude Code's own, and an `omp.monitors` key in
+`package.json` for omp), `bin/mattermost-monitor` — a plain `sh` shim that
+resolves its own real path before handing off to
+`adapters/bin/mattermost-watch`, so the directory works symlinked into an
+extensions directory or copied into a plugin cache — and a generated copy of
+the skill under `skills/mattermost/`. The declaration is a single entry:
+
+```json
+{
+  "name": "mattermost-events",
+  "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/mattermost-monitor \"${MATTERMOST_AGENT_CONFIG}\"",
+  "when": "always",
+  "label": "mattermost inbox"
+}
+```
+
+That is abbreviated: the real entry also carries the long `description` the
+agent reads, which says that this monitor is the only thing that wakes it,
+that nothing restarts it, and what exit `3` means. Everything past the shim is
+core: one JSON event per stdout line, diagnostics on stderr. There is no
+second implementation of delivery to keep in sync with the first.
+
 ### OMP
 
-The default is a pinned single-profile install, unchanged from earlier releases:
+omp does not read plugin monitors on its own; the
+[`omp-monitor`](https://github.com/Orange-County-AI/omp-monitor) extension
+does, from v0.3.0. Install it, then make this plugin visible the same way:
+
+```sh
+ln -s /abs/path/to/omp-monitor ~/.omp/agent/extensions/omp-monitor
+ln -s /abs/path/to/mattermost-agents/adapters/plugin \
+      ~/.omp/agent/extensions/mattermost-agents
+```
+
+`omp plugin link` is the other route; both user-scope plugin roots —
+`~/.omp/agent/extensions/<plugin>/` and `~/.omp/plugins/node_modules/<plugin>/`
+— are scanned. The directory's leaf name is the plugin name and the agent sees
+it, so keep it `mattermost-agents`. Then launch with the profile in the
+environment:
+
+```sh
+cd /abs/path/to/worktree
+MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/docs-bot.json omp
+```
+
+At session start omp-monitor scans those roots, reads `monitors/monitors.json`
+(or a `monitors`, `experimental.monitors` or `omp.monitors` key in either
+harness's plugin manifest, or in `package.json`) and arms every
+`when: "always"` entry — in interactive sessions only, and never from the
+project directory, so a checkout somebody merely opened arms nothing.
+`${CLAUDE_PLUGIN_ROOT}` and `${OMP_PLUGIN_ROOT}` expand to the plugin
+directory; every other `${VAR}` comes from the session environment, and an
+**unset** variable withholds that monitor rather than running it. That is
+precisely why the command names `"${MATTERMOST_AGENT_CONFIG}"`: a machine that
+never exports it arms nothing, quietly and correctly, instead of starting a
+command that exits 78 in every session.
+
+Armed, the monitor is `mattermost-agents:mattermost-events` — plugin name,
+then entry name. `/monitor` lists it,
+`/monitor stop mattermost-agents:mattermost-events` ends it, and omp-monitor's
+own footer segment shows its label, `mattermost inbox`. It belongs to the
+session and dies with it; there is no daemon and no state on disk.
+
+The monitor delivers messages and nothing else; it ships no operating rules.
+Give the agent those by installing this repository's root `SKILL.md` wherever
+that harness loads skills from — copy it, or symlink it if your loader follows
+links. It is the canonical text for both harnesses, and the plugin's
+`skills/mattermost/SKILL.md` is a generated copy of it.
+
+#### The tools are a per-project MCP server
+
+The monitor wakes the session; the tools that answer are installed per project.
+The default is a pinned single-profile install, unchanged from earlier
+releases:
 
 ```sh
 bun adapters/install-project.ts \
@@ -105,21 +182,20 @@ bun adapters/install-project.ts \
   --server-name mattermost-docs-bot
 ```
 
-It edits three files inside `<project>/.omp/` and nothing else:
+It edits two files inside `<project>/.omp/` and nothing else:
 
-- `settings.json` — `extensions` gains the extension **entry file**,
-  `adapters/omp-extension/index.ts`. Never the directory: OMP would scan it and
-  try to load the helper modules beside it as extensions of their own.
 - `mcp.json` — `mcpServers` gains one stdio server running
   `adapters/bin/mattermost-mcp`.
-- `.omp/.gitignore` — keeps those, the install record and itself out of the
+- `.gitignore` — keeps that file, the install record and itself out of the
   project's history because they contain machine-local paths.
 
-In pinned mode the server entry embeds the profile's literal path. The
-extension reads the same pin when the environment is silent, so an ordinary
-`omp` launch or saved-session resume uses exactly the account its MCP tools use.
-If `MATTERMOST_AGENT_CONFIG` is also set, it must resolve to that same path;
-disagreement remains fatal.
+In pinned mode the server entry embeds the profile's literal path, so the tools
+act as that account whatever the session environment says. The listener is a
+separate question: the monitor declaration reads the environment and nothing
+else, so a pinned project still needs `MATTERMOST_AGENT_CONFIG` exported before
+anything is armed, and it should name the same profile the pin names. Nothing
+compares the two any more — the component that did is gone — so a session that
+exports a different profile listens as one account and replies as another.
 
 For multiple OMP processes in the **same project directory**, install explicit
 shared-project mode once:
@@ -145,19 +221,22 @@ cd /abs/path/to/worktree
 MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/release-bot.json omp
 ```
 
-The generic MCP child and extension watcher inherit only their OMP process's
-selection. Each profile must retain its own credential and `stateDir`. With the
-variable unset, the shared-project watcher is inactive and reports:
+Each process inherits only its own selection: the MCP child takes the variable
+from its session environment, and the monitor that session arms is pinned to
+the same variable, so two sessions in one working directory are two identities
+with two state directories rather than a fight over one. Each profile must
+retain its own credential and `stateDir`. With the variable unset that session
+arms no monitor at all, and its MCP server refuses to start:
 
 ```text
-<project>/.omp/mcp.json server "mattermost-session" (shared-project mode) requires MATTERMOST_AGENT_CONFIG; launch OMP with MATTERMOST_AGENT_CONFIG=/absolute/path/to/profile.json
+mattermost-adapter: MATTERMOST_AGENT_CONFIG is not set: this session is not a Mattermost consumer
 ```
 
-A generic server beside a project pin, multiple generic servers, an unresolved
-placeholder, or a missing selected profile fails closed; no profile is guessed
-and no set of configured identities is started.
+A generic server beside a project pin, or a second generic server, is refused
+at install time; no profile is guessed and no set of configured identities is
+started.
 
-The install record uses `mattermost-agents/install-record/2` and records
+The install record uses `mattermost-agents/install-record/3` and records
 `mode: "pinned"` or `mode: "shared"`. Re-running the same command is
 idempotent. To migrate an installer-owned pinned project, run the
 `--shared-project` command with the **same** `--server-name`; migration removes
@@ -166,137 +245,11 @@ has no matching install record. `--dry-run` reports the plan.
 `--rollback` removes only recorded additions while their files retain the
 recorded hashes.
 
-**A newly installed JavaScript extension needs the session restarted.** OMP
-loads extension factories at session start; `/reload-plugins` does not pick up
-an extension that was not loaded, so install, then restart—resuming the saved
-session preserves the conversation. Once loaded, `/mattermost status` reports
-the listener's state, the config it resolved, where that identity came from,
-and the last few diagnostics; `/mattermost start|stop|restart` control it.
-
-**The install path is live for every session on the host, so land changes
-whole.** OMP imports the extension file it finds at session start, and a load
-that fails is reported exactly once — `Failed to load extension: N errors
-building …/watcher.ts` — with no retry, no `/reload-plugins` recovery (the
-factory never ran, so there is nothing to reload) and no `/mattermost` command
-in that session to repair it with. The failure is silent from every other
-angle: the footer has no segment, `status` shows nothing, and only that one log
-line says why. So edit a checkout that other sessions share *atomically* —
-commit and `git pull`, or any whole-file replacement — and never edit the
-installed file in place: a multi-step edit walks the file through intermediate
-states, and a session starting mid-edit loads whatever is on disk at that
-instant and stays unreachable for the rest of its life. Measured on
-ws-52labs, 2026-09-14: a session started 7s into an edit sequence, got
-`6 errors building watcher.ts?mtime=…`, and ran with no listener, no
-`/mattermost`, and a perfectly ordinary-looking footer.
-
-**A session that starts while another one is already listening waits its turn
-instead of dying.** A second `watch` on one profile exits `3`, which is the
-working case rather than a fault — and the usual reason for it is a predecessor
-that is still shutting down. Treating that as fatal is how a session launched a
-second too early ends up deaf for its whole life, with nothing in the footer to
-say so, so the adapter waits: it reports `waiting` rather than `failed`,
-re-checks on a doubling interval capped at two minutes, and takes the listener
-over the moment the lock is released. The session launched last is the one that
-ends up listening, however the two overlap. Nothing here is a crash — the wait
-never counts against the restart budget and never expires — and `/mattermost
-status` names which check it is on. A genuinely unfixable exit is still
-terminal: `2` (config) and `4` (auth) fail at once, because retrying cannot fix
-either.
-
-The extension delivers messages and owns `/mattermost`; it ships no skill of
-its own. Give the agent the operating rules by installing this repository's
-root `SKILL.md` wherever that harness loads skills from—copy it, or symlink it
-if your loader follows links. It is the canonical text for both harnesses.
-
-**Mail interrupts a working session.** A batch of events arrives as one
-`aside` custom message: OMP injects it at the running turn's next step
-boundary, flushes it the moment a turn ends if it arrived on the turn's last
-step, and starts a turn for it when the session is idle. Nobody has to press a
-key for it to appear, and a half-typed prompt in the editor is left alone. The
-whole coalesced batch travels as a single message because OMP drops concurrent
-`aside` sends — the first starts the turn and the rest are refused silently.
-
-#### What the footer shows
-
-One line, whatever else is loaded. OMP renders one footer line per status key
-— measured in its status-line component, which sorts the keys and pushes a
-line each — so this extension does not take a key of its own: it writes a
-segment into a small `globalThis` registry under the shared key `channels`,
-and every channel integration in the process draws the same joined line, chat
-segment first. Nothing here depends on the other integrations existing; with
-only this one installed the line is only this segment.
-
-```
- ocai/stub·ticket500/stub │ 󰊫 ocai/stub@theticket500.com
-```
-
-Each segment opens with its integration's brand logo — `dev-mattermost`
-(U+E927) here, `md-gmail` (U+F02AB) for the mailbox — then one space, then
-what it has to say. The default names each connection AND the account this
-session acts as on it, `connection/user`: a connection id alone says which
-server, never which of two agents you are looking at, and two agents sharing
-one account once read identically here while only one of them was receiving
-anything. The account comes from the listener's own `watcher_identity` row —
-what a credential actually authenticated as, written at every successful
-authentication — not from the profile, which pins only an opaque user id. A
-connection nothing has authenticated for yet is named by its connection id
-alone rather than not at all.
-
-A count is opt-in: next to a named identity it says little, and a footer that
-talks while everything works is a footer nobody reads. What the line always
-says is when something is NOT listening —
-
-```
- ocai/stub·ticket500/stub!stale
-```
-
-— and that comes from the listener's own heartbeat in `stateDir`, the same
-rows `status` reads, not from this process's opinion of its child. A
-credential that authenticates proves nothing about whether anything is
-listening; a heartbeat does. The words are the ones `status` uses:
-`retrying`, `stale`, `absent`, `stopped`, plus `auth` for a refused
-credential and `config` for a profile the listener cannot load. They stay
-words under every label style: a logo names an integration, it never
-diagnoses one.
-
-**And when the listener is healthy but it is not yours.**
-
-```
- ocai/fleet!elsewhere#12127
-```
-
-`!elsewhere#PID` means the single-watcher lock for that connection is held by
-a live process outside this session's own listener — another pane, another
-agent, another window. It exists because `health: live` does not tell you
-that: `watcher_health` is keyed by connection and origin only, so the session
-that DOES hold the lock writes `listening` into the state file both sessions
-read, and the session that receives nothing reads the other one's good news
-as its own. Only the lock says who is actually being delivered to, so the
-lock is what this marker reports; the number is the holding pid, because
-nothing in local state records which pane a listener was started from and
-asking would be a call this line refuses to make. `/mattermost status` prints
-the same thing in full, with the host.
-
-The `status` block in the profile chooses the fields, the style and the label
-(see the profile table above); the markers are not fields and cannot be
-switched off. A field list that asks for no name at all still gets the full
-`connection/user` beside a marker — "something went deaf" is useless without
-"which identity".
-
-**If the label renders as a box.** That is tofu: your terminal font has no
-U+E927. Mattermost's logo needs a Nerd Fonts build at least as new as the one
-that carries U+E927 — the current set has it (3.5.1 does) and older builds may
-not, so installing the current Nerd Fonts *Symbols Only* release is the fix
-that keeps the logo. Gmail's U+F02AB is the easy case: mainstream Nerd Font
-builds have shipped it for years. Two more fixes need no font at all, both in
-the profile's `status` block and neither needing a release: `"label": "text"`
-goes back to `mm`, or `"glyph": "…"` takes any character your font does have —
-paste the character itself, or write it as JSON escapes (`md-message`,
-U+F0361, is `"\udb80\udf61"`: JSON escapes are UTF-16 units, so a codepoint
-above U+FFFF takes a surrogate pair). Anything wider than two terminal
-columns, or empty, is refused at load with the rest of the block.
-`/mattermost status` prints the label style and the codepoint in force, so you
-can read exactly which character your font is missing.
+**An install from before the extension was retired still owns an entry in
+`settings.json`.** Records at schema 1 and 2 added it there; this version never
+touches that file, so installing over such a record is refused and names the
+way out — `--rollback` in that project first, which still takes the extension
+entry back out, then install again.
 
 ### Claude Code
 
@@ -307,14 +260,16 @@ apart; authenticate that instance normally):
 
 ```sh
 export CLAUDE_CONFIG_DIR=~/.config/claude-docs-bot
+repo=/abs/path/to/mattermost-agents
 mkdir -p "$CLAUDE_CONFIG_DIR/skills"
-ln -s /abs/path/to/mattermost-agents/adapters/claude-plugin/skills/mattermost \
-      "$CLAUDE_CONFIG_DIR/skills/mattermost"
+ln -s "$repo/adapters/plugin/skills/mattermost" "$CLAUDE_CONFIG_DIR/skills/mattermost"
 ```
 
-The monitor is `adapters/claude-plugin/monitors/monitors.json` →
-`adapters/claude-plugin/bin/mattermost-monitor`, a plain `sh` wrapper that
-reads **only the environment**. So export the profile in that agent's launcher:
+The monitor is `adapters/plugin/monitors/monitors.json` →
+`adapters/plugin/bin/mattermost-monitor`, and the profile reaches it from the
+environment: Claude Code substitutes an unset `${MATTERMOST_AGENT_CONFIG}` with
+nothing and runs the command anyway, and an empty argument falls back to the
+variable itself. So export the profile in that agent's launcher:
 
 ```sh
 MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/docs-bot.json claude
@@ -337,14 +292,6 @@ named for the identity, with the profile as a literal value:
 
 Plain `claude` and `claude --resume` are all you need — no extra flags.
 
-**Claude Code does not re-arm a killed monitor.** A hard reboot, an OOM kill or
-a crashed `claude` leaves the MCP server running and the monitor gone, and the
-harness tends to *ask the user* before starting one again — a prompt that
-deadlocks, because the person who would answer it usually reaches this agent
-through the very channel that is down. So the monitor's `description` and the
-skill both tell the agent to check `watcher.state` and re-arm on its own
-authority, then say it did. Give the agent the skill, not just the monitor.
-
 **Why the MCP server is not bundled globally.** This server carries a
 Mattermost identity. Declared globally it would be launched by every unrelated
 session on the machine, as the wrong account for all of them; and a single
@@ -353,6 +300,29 @@ profile, which then suppresses it everywhere including the project that needed
 it. Per-project (or per-profile) declaration with an identity-specific server
 name keeps one agent's identity inside one project, and keeps two agents on one
 machine from colliding.
+
+### Re-arming is the agent's own job
+
+**Neither harness brings a killed monitor back.** A hard reboot, an OOM kill or
+a crashed harness leaves the MCP server running and the monitor gone, and
+Claude Code in particular tends to *ask the user* before starting one again — a
+prompt that deadlocks, because the person who would answer it usually reaches
+this agent through the very channel that is down. So the declaration's
+`description` and the skill both tell the agent to check `watcher.state` and
+re-arm on its own authority, then say it did: in omp, `/monitor` still names
+the monitor that ended and the command it ran, and the `monitor` tool starts
+that command again; in Claude Code, start the plugin's background monitor
+again. Give the agent the skill, not just the monitor.
+
+**A second watcher on one identity exits `3`, and that is health, not a
+fault.** The lock admits one listener per identity; a second `watch` exits `3`
+and names the holder, and the declaration says so because the only useful
+response is to leave that holder alone rather than start a rival. Two sessions
+that really do share one identity — as opposed to two identities in one
+directory, which the environment already separates — are arbitrated by that
+lock, and the one that loses stays exited. A genuinely unfixable exit is
+different: `2` (config) and `4` (auth) fail at once, because retrying cannot
+fix either.
 
 ## 3. Talk to it
 
@@ -672,11 +642,10 @@ each other's events.
 
 - **One watcher per profile.** A heartbeat lock enforces it; a second `watch`
   on the same profile exits `3` and names the holder. Do not run a second
-  listener for the same profile — the harness adapters already run one, so
-  `watch` by hand is for debugging or for a harness that has no monitor. The
-  OMP adapter takes exit `3` as "wait your turn": it re-checks until the lock is
-  free and then takes over, so a session started while a predecessor was still
-  shutting down ends up listening rather than mute.
+  listener for the same profile — the monitor each session arms already runs
+  one, so `watch` by hand is for debugging or for a harness that has no
+  monitor. Exit `3` is the working case: that identity is already being
+  listened to, and the response is to leave the holder alone.
 - **At-least-once delivery.** An event is committed before it is printed, so a
   crash re-delivers rather than loses; a re-delivery is flagged
   `replayed: true`. Ignore an `event_id` you have already handled.
@@ -733,8 +702,8 @@ each other's events.
 ## Layout
 
 - `SKILL.md` — the canonical agent-facing skill: how messages arrive, and the
-  rules for answering, acking, scope, identity and idempotency. The Claude
-  plugin's `skills/mattermost/SKILL.md` is a generated copy of it
+  rules for answering, acking, scope, identity and idempotency. The plugin
+  directory's `skills/mattermost/SKILL.md` is a generated copy of it
   (`bun run skill:sync`), and a test fails if the two ever diverge.
 - `src/mattermost.ts` — the only holder of the token; every authed HTTP call.
 - `src/agent/config.ts` — profiles: which server, which identity, what scope.
@@ -746,7 +715,9 @@ each other's events.
 - `src/agent/collab.ts` — identity, users, teams, channels, DMs.
 - `src/agent/mcp.ts` / `src/agent/cli.ts` — the same operations as tools and as commands.
 - `src/admin/` — operator-only provisioning; never an agent tool.
-- `adapters/` — harness glue: OMP extension, Claude monitor + skill, `bin/` wrappers, `install-project.ts`.
+- `adapters/` — harness glue: `plugin/` (the monitor declaration both harnesses
+  read, the monitor shim, the generated skill copy), `bin/` wrappers,
+  `install-project.ts`.
 
 ## Develop / test
 

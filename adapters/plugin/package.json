@@ -1,0 +1,9 @@
+{
+	"name": "mattermost-agents",
+	"version": "0.2.0",
+	"private": true,
+	"description": "Mattermost delivery for coding agents: one background monitor, declared once and read by Claude Code and omp alike.",
+	"omp": {
+		"monitors": "./monitors/monitors.json"
+	}
+}

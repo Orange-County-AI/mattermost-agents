@@ -1,0 +1,14 @@
+#!/bin/sh
+# Plugin entry for the background monitor, for both harnesses.
+#
+# Claude Code starts it from monitors/monitors.json; omp starts the same
+# declaration through omp-monitor, which reads this directory as a plugin.
+# Resolves its own real path first, so the plugin works when it is symlinked
+# into a skills or extensions directory or copied into a plugin cache, then
+# hands off to the repo-level wrapper. Everything after this line is core: one
+# JSON event per stdout line, diagnostics on stderr.
+#
+# Arguments pass through, so the declaration can name the profile explicitly.
+set -eu
+
+exec "$(dirname "$(readlink -f "$0")")/../../bin/mattermost-watch" "$@"

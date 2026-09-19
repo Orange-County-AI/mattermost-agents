@@ -219,14 +219,13 @@ restart.
 
 ## When nothing arrives
 
-The listener needs exactly one explicit profile for *this* identity. A pinned
-OMP project may supply its one literal profile through `.omp/mcp.json`.
-Otherwise `MATTERMOST_AGENT_CONFIG` in the session environment supplies it.
+The listener needs exactly one explicit profile for *this* identity, and
+`MATTERMOST_AGENT_CONFIG` in the session environment is what supplies it.
 Nothing scans profile directories, looks under `$HOME`, infers from the working
 directory, expands a placeholder, or starts every configured identity.
 
-A project shared by multiple concurrent OMP agents is installed once with a
-generic server:
+A project shared by multiple concurrent agents is installed once with a
+generic MCP server:
 
 ```sh
 bun /abs/path/to/mattermost-agents/adapters/install-project.ts \
@@ -248,12 +247,11 @@ cd /abs/path/to/worktree
 MATTERMOST_AGENT_CONFIG=/abs/path/to/profiles/release-bot.json omp
 ```
 
-The generic MCP child and extension watcher inherit only their own OMP
-process's value. In shared-project mode, an unset value is deliberately
-inactive and names the required launch form exactly; a project pin beside the
-generic server is a conflict and fails closed. In pinned mode, an environment
-value that disagrees with the project pin remains fatal. None of those cases
-chooses a fallback.
+Each process inherits only its own value: the MCP child gets it from the
+environment, and the declared monitor names the same variable, so a session
+without it arms no listener at all rather than starting one against a profile
+nobody chose. A project pin beside the generic server is a conflict and fails
+closed. None of those cases picks a fallback.
 
 With no identity outside a shared project the listener is deliberately
 inactive: not an error, just "not set up in this session". With a selected but
@@ -316,9 +314,10 @@ you cannot hear — you would sit there deaf, waiting for an answer that by
 construction cannot arrive. Re-arming is cheap and loses nothing: events that
 were never settled come back with `replayed: true`.
 
-- **In OMP**: `/mattermost restart` — or `/mattermost start` when nothing is
-  running yet. `/mattermost status` shows the same picture from inside the
-  session.
+- **In omp**: `/monitor` lists this session's monitors, including the one that
+  ended and the command it ran; start it again with the `monitor` tool, naming
+  that same command. A declared monitor is armed at session start, so a
+  session that never had one is a session whose identity variable was unset.
 - **In Claude Code**: restart the plugin's background monitor. That harness
   does not bring a killed monitor back by itself, and it will want to ask you
   first — re-arm it anyway and say you did; the approval you would be waiting
@@ -334,9 +333,8 @@ Three cases where starting a listener is the wrong move:
   riding.
 - **`lock-held`, exit `3`, means somebody else is already listening** for this
   identity. That is the working case, not a failure — never start a second one.
-  In OMP the adapter already handles it: it waits its turn and takes the
-  listener over the moment the other one stops, so nothing needs doing. In
-  Claude Code the monitor exits and stays exited; leave it alone.
+  The monitor exits and stays exited in both harnesses; leave it alone, and
+  expect the listener to be wherever that pid is.
 - **`auth-error` / `identity-error`** needs a human with a credential; no
   number of restarts fixes a revoked token. Say what it says.
 

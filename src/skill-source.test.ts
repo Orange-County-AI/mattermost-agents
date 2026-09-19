@@ -1,8 +1,8 @@
 /**
  * The agent-facing skill has ONE source: `SKILL.md` at the repository root.
  *
- * The Claude plugin needs the same text at
- * `adapters/claude-plugin/skills/mattermost/SKILL.md`, and it must be a REGULAR
+ * The plugin needs the same text at
+ * `adapters/plugin/skills/mattermost/SKILL.md`, and it must be a REGULAR
  * FILE there: `claude plugin validate --strict` refuses to read a symlinked
  * component, and a plugin manifest cannot point at a skill outside its own tree
  * (`..` is rejected as path traversal). So that entry is a generated copy —
@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path'
 
 const ROOT = dirname(import.meta.dir)
 const CANONICAL = join(ROOT, 'SKILL.md')
-const PLUGIN_COPY = join(ROOT, 'adapters', 'claude-plugin', 'skills', 'mattermost', 'SKILL.md')
+const PLUGIN_COPY = join(ROOT, 'adapters', 'plugin', 'skills', 'mattermost', 'SKILL.md')
 
 test('the plugin ships the root SKILL.md byte for byte, as a regular file', async () => {
   const canonical = await Bun.file(CANONICAL).text()
@@ -79,9 +79,11 @@ test('the canonical skill still tells the agent to re-arm its own listener', asy
   // `health: live` proves the credential, never that anything is listening.
   expect(text).toContain('health: live')
 
-  // The rule, and the command for each harness that can act on it.
+  // The rule, and how each harness acts on it now that delivery is a monitor
+  // in both: omp lists and restarts one with `/monitor`, Claude Code restarts
+  // the plugin's own.
   expect(text).toMatch(/re-arm/i)
-  expect(text).toContain('/mattermost restart')
+  expect(text).toContain('`/monitor`')
   expect(text).toMatch(/Claude Code/)
 
   // And the two cases where a second listener is the wrong answer.
@@ -90,10 +92,10 @@ test('the canonical skill still tells the agent to re-arm its own listener', asy
 
 test('the plugin monitor description carries the re-arm rule too', async () => {
   const monitors = (await Bun.file(
-    join(ROOT, 'adapters', 'claude-plugin', 'monitors', 'monitors.json'),
+    join(ROOT, 'adapters', 'plugin', 'monitors', 'monitors.json'),
   ).json()) as { name: string; description: string }[]
 
-  // Claude Code shows this string, and does not restart a killed monitor on
+  // Both harnesses show this string, and neither restarts a killed monitor on
   // its own — so it is the first place an agent can learn the rule.
   const monitor = monitors.find((entry) => entry.name === 'mattermost-events')
   expect(monitor).toBeDefined()

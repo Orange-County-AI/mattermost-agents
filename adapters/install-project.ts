@@ -10,37 +10,39 @@
  *     --server-name mattermost-fleet-security
  *
  * Shared-project mode installs one generic server. Every OMP process must name
- * its own existing profile in `MATTERMOST_AGENT_CONFIG`; both the MCP child and
- * this extension inherit that session environment:
+ * its own existing profile in `MATTERMOST_AGENT_CONFIG`; the MCP child inherits
+ * that session environment, and the listener is armed separately by the monitor
+ * declaration the plugin directory ships:
  *
  *   bun adapters/install-project.ts \
  *     --project /abs/path/to/worktree \
  *     --shared-project \
  *     --server-name mattermost-session
  *
- * It touches exactly three files inside `<project>/.omp/`:
+ * It touches exactly two files inside `<project>/.omp/`:
  *
- *   settings.json  `extensions` gains the extension ENTRY FILE — never the
- *                  directory, which OMP would scan, loading `locate.ts` and
- *                  `watcher.ts` as extensions of their own.
  *   mcp.json       `mcpServers` gains one stdio server running the shared
  *                  wrapper. Pinned mode sets `MATTERMOST_AGENT_CONFIG`;
  *                  shared-project mode deliberately does not.
- *   .gitignore     keeps both of those, the install record and itself out of
- *                  the project's history: they contain machine-local paths.
+ *   .gitignore     keeps that file, the install record and itself out of the
+ *                  project's history: they contain machine-local paths.
  *
  * What it refuses rather than guesses: a config path that is a symlink or
  * resolves outside the project (it would edit somebody else's config), an
  * existing server of the same name that is configured differently, ambiguous
- * Mattermost server entries, another checkout's copy of this extension already
- * in `extensions`, and an existing ignore rule that deliberately un-ignores
- * one of these files.
+ * Mattermost server entries, and an existing ignore rule that deliberately
+ * un-ignores one of these files.
  *
  * Re-running a pinned install with `--shared-project` is the one supported
  * migration. It is allowed only when this install record owns the existing
  * server and its MCP file still has the recorded hash. `--rollback` removes
  * only what a previous run added, and only while the files still hash to what
  * that run left behind.
+ *
+ * An install written by an older version of this tool also added the retired
+ * OMP extension to `<project>/.omp/settings.json`. `--rollback` still takes
+ * that entry back out; installing over such a record is refused instead,
+ * because this version does not touch `settings.json` at all.
  *
  * Credentials are never read, written or logged here: a pinned profile is only
  * a path, and core alone resolves what is inside it.
@@ -62,14 +64,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const EXTENSION_ENTRY = join(HERE, "omp-extension", "index.ts");
 const MCP_WRAPPER = join(HERE, "bin", "mattermost-mcp");
 const CONFIG_ENV = "MATTERMOST_AGENT_CONFIG";
 const RECORD_SCHEMA_V1 = "mattermost-agents/install-record/1";
-const RECORD_SCHEMA = "mattermost-agents/install-record/2";
+const RECORD_SCHEMA_V2 = "mattermost-agents/install-record/2";
+const RECORD_SCHEMA = "mattermost-agents/install-record/3";
 const RECORD_FILE = "mattermost-agents-install.json";
 const IGNORE_HEADER = "# Local Mattermost harness wiring — machine-specific, never committed.";
-const IGNORED_FILES = ["mcp.json", "settings.json", RECORD_FILE, ".gitignore"];
+const IGNORED_FILES = ["mcp.json", RECORD_FILE, ".gitignore"];
 /** EX_CONFIG, as the wrappers use: this is a setup problem, not a crash. */
 const EX_CONFIG = 78;
 
@@ -78,18 +80,27 @@ const USAGE = `usage:
   install-project.ts --project <dir> --shared-project --server-name <name> [--dry-run]
   install-project.ts --project <dir> --rollback [--dry-run]`;
 
-/** The slices of the OMP files this installer owns; everything else is preserved verbatim. */
-interface SettingsFile {
-	extensions?: unknown;
-	[key: string]: unknown;
-}
-
+/** The slice of `mcp.json` this installer owns; everything else is preserved verbatim. */
 interface McpFile {
 	mcpServers?: Record<string, unknown>;
 	[key: string]: unknown;
 }
 
-/** What a recorded file gained, so rollback removes that and nothing else. */
+/**
+ * The slice of `settings.json` an older version of this installer owned. This
+ * version never reads or writes that file during an install; the shape lives on
+ * only so `--rollback` can take an old record's extension entry back out.
+ */
+interface SettingsFile {
+	extensions?: unknown;
+	[key: string]: unknown;
+}
+
+/**
+ * What a recorded file gained, so rollback removes that and nothing else. No
+ * new install produces `"extension"`: it is reachable only through a v1 or v2
+ * record, which this tool must still be able to undo.
+ */
 type Owned = "extension" | "server" | "lines";
 
 interface FileRecord {
@@ -103,14 +114,18 @@ interface FileRecord {
 
 type InstallMode = "pinned" | "shared";
 
+type RecordSchema = typeof RECORD_SCHEMA | typeof RECORD_SCHEMA_V2 | typeof RECORD_SCHEMA_V1;
+
 interface InstallRecord {
-	schema: typeof RECORD_SCHEMA;
+	/** The schema as found on disk: a v1 or v2 record is undone, not rewritten, by a rollback. */
+	schema: RecordSchema;
 	installedAt: string;
 	adapters: string;
 	mode: InstallMode;
 	serverName: string;
 	profile?: string;
-	extensionEntry: string;
+	/** v1 and v2 records only: the extension entry the retired installer added. */
+	extensionEntry?: string;
 	files: Record<string, FileRecord>;
 }
 
@@ -177,25 +192,31 @@ function readJsonObject(path: string, label: string): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
-function readInstallRecord(path: string): { record: InstallRecord; upgradedFromV1: boolean } {
+function readInstallRecord(path: string): InstallRecord {
 	const raw = readJsonObject(path, "install record") as StoredInstallRecord;
-	if (raw.schema !== RECORD_SCHEMA && raw.schema !== RECORD_SCHEMA_V1) {
-		fail(`${path} is schema ${String(raw.schema)}, not ${RECORD_SCHEMA} or ${RECORD_SCHEMA_V1}`);
+	const schema = raw.schema;
+	if (schema !== RECORD_SCHEMA && schema !== RECORD_SCHEMA_V2 && schema !== RECORD_SCHEMA_V1) {
+		fail(`${path} is schema ${String(schema)}, not ${RECORD_SCHEMA}, ${RECORD_SCHEMA_V2} or ${RECORD_SCHEMA_V1}`);
 	}
+	const legacy = schema !== RECORD_SCHEMA;
 	if (
 		typeof raw.installedAt !== "string" ||
 		typeof raw.adapters !== "string" ||
 		typeof raw.serverName !== "string" ||
-		typeof raw.extensionEntry !== "string" ||
 		!raw.files ||
 		typeof raw.files !== "object" ||
 		Array.isArray(raw.files)
 	) {
 		fail(`${path} is not a valid Mattermost install record`);
 	}
+	// Every v1 and v2 record was written by a version that also installed the
+	// OMP extension, so it always names the entry file it added; a record of
+	// the current schema that names one did not come from this tool.
+	if (legacy ? typeof raw.extensionEntry !== "string" : raw.extensionEntry !== undefined) {
+		fail(`${path} is not a valid ${String(schema)} install record`);
+	}
 
-	const upgradedFromV1 = raw.schema === RECORD_SCHEMA_V1;
-	const mode = upgradedFromV1 ? "pinned" : raw.mode;
+	const mode = schema === RECORD_SCHEMA_V1 ? "pinned" : raw.mode;
 	if (mode !== "pinned" && mode !== "shared") fail(`${path} has invalid install mode ${String(mode)}`);
 	if (mode === "pinned" && (typeof raw.profile !== "string" || raw.profile.length === 0)) {
 		fail(`${path} records pinned mode without a profile`);
@@ -220,21 +241,21 @@ function readInstallRecord(path: string): { record: InstallRecord; upgradedFromV
 		) {
 			fail(`${path} has an invalid file record for ${file}`);
 		}
+		if (state.owns === "extension" && !legacy) {
+			fail(`${path} claims an extension entry in ${file}, which schema ${RECORD_SCHEMA} never installs`);
+		}
 		files[file] = state as FileRecord;
 	}
 
 	return {
-		record: {
-			schema: RECORD_SCHEMA,
-			installedAt: raw.installedAt,
-			adapters: raw.adapters,
-			mode,
-			serverName: raw.serverName,
-			...(mode === "pinned" ? { profile: raw.profile as string } : {}),
-			extensionEntry: raw.extensionEntry,
-			files,
-		},
-		upgradedFromV1,
+		schema,
+		installedAt: raw.installedAt,
+		adapters: raw.adapters,
+		mode,
+		serverName: raw.serverName,
+		...(mode === "pinned" ? { profile: raw.profile as string } : {}),
+		...(legacy ? { extensionEntry: raw.extensionEntry as string } : {}),
+		files,
 	};
 }
 
@@ -262,46 +283,6 @@ interface Plan {
 	body: string;
 	change: string;
 	addedLines?: string[];
-}
-
-function planSettings(path: string, entry: string): Plan | string {
-	const existed = existsSync(path);
-	const settings: SettingsFile = existed ? readJsonObject(path, "project settings") : {};
-	const configured = settings.extensions;
-	if (configured !== undefined && !Array.isArray(configured)) {
-		fail(`project settings ${path} has a non-array "extensions"`);
-	}
-	const extensions: unknown[] = Array.isArray(configured) ? [...configured] : [];
-
-	for (const value of extensions) {
-		if (typeof value !== "string") continue;
-		const resolved = resolve(dirname(dirname(path)), value);
-		if (resolved === entry) return `extensions already load ${entry}`;
-		if (resolved === dirname(entry)) {
-			fail(
-				`project settings ${path} loads the extension DIRECTORY ${value}; ` +
-					"OMP scans it and loads the helper modules as extensions too — replace that entry with the index.ts file",
-			);
-		}
-		// A second copy of this extension, from another checkout, would supervise
-		// a second listener for the same identity. Repoint it, do not add to it.
-		if (resolved.endsWith("/omp-extension/index.ts") || resolved.endsWith("/omp-extension")) {
-			fail(
-				`project settings ${path} already loads another copy of this extension (${value}); ` +
-					`repoint that entry at ${entry} instead of adding a second one`,
-			);
-		}
-	}
-
-	extensions.push(entry);
-	return {
-		path,
-		owns: "extension",
-		existed,
-		sha256Before: existed ? digest(path) : null,
-		body: asJson({ ...settings, extensions }),
-		change: `extensions += ${entry}`,
-	};
 }
 
 function planMcp(path: string, request: InstallRequest, migrateOwnedPin: boolean): Plan | string {
@@ -423,11 +404,8 @@ function install(projectDir: string, requested: InstallRequest, dryRun: boolean)
 	if (!/^[A-Za-z0-9_.:-]{1,100}$/.test(requested.serverName)) {
 		fail(`--server-name ${requested.serverName} is not a valid MCP server name`);
 	}
-	for (const [label, path] of [
-		["extension entry", EXTENSION_ENTRY],
-		["MCP wrapper", MCP_WRAPPER],
-	] as const) {
-		if (!existsSync(path)) fail(`${label} missing at ${path}; run this from the mattermost-agents checkout`);
+	if (!existsSync(MCP_WRAPPER)) {
+		fail(`MCP wrapper missing at ${MCP_WRAPPER}; run this from the mattermost-agents checkout`);
 	}
 	if ((statSync(MCP_WRAPPER).mode & 0o111) === 0) fail(`MCP wrapper ${MCP_WRAPPER} is not executable`);
 
@@ -449,12 +427,10 @@ function install(projectDir: string, requested: InstallRequest, dryRun: boolean)
 
 	const ompDir = join(project, ".omp");
 	assertWritablePath(ompDir, projectReal, "project config directory");
-	const settingsPath = join(ompDir, "settings.json");
 	const mcpPath = join(ompDir, "mcp.json");
 	const ignorePath = join(ompDir, ".gitignore");
 	const recordPath = join(ompDir, RECORD_FILE);
 	for (const [label, path] of [
-		["project settings", settingsPath],
 		["project MCP config", mcpPath],
 		["project ignore file", ignorePath],
 		["install record", recordPath],
@@ -466,12 +442,21 @@ function install(projectDir: string, requested: InstallRequest, dryRun: boolean)
 	// already owns in the others are still there, so their records carry over —
 	// dropping them would leave rollback nothing to take back.
 	let previous: InstallRecord | null = null;
-	let upgradeRecord = false;
+	let upgradeFrom: RecordSchema | null = null;
 	let migrateOwnedPin = false;
 	if (existsSync(recordPath)) {
-		const loaded = readInstallRecord(recordPath);
-		previous = loaded.record;
-		upgradeRecord = loaded.upgradedFromV1;
+		previous = readInstallRecord(recordPath);
+		upgradeFrom = previous.schema === RECORD_SCHEMA ? null : previous.schema;
+		// A v1 or v2 record owns an extension entry in settings.json that this
+		// version neither writes nor may quietly forget: a rollback of that
+		// record is the only thing left that still removes the entry, so send
+		// the operator through it instead of stranding it in the file.
+		if (Object.values(previous.files).some((state) => state.owns === "extension")) {
+			fail(
+				`${recordPath} records an install that added the retired OMP extension to ` +
+					`${join(ompDir, "settings.json")}; run --rollback here first, then install again`,
+			);
+		}
 		if (previous.serverName !== request.serverName) {
 			fail(
 				`${recordPath} records a ${previous.mode} install named "${previous.serverName}"; ` +
@@ -501,19 +486,15 @@ function install(projectDir: string, requested: InstallRequest, dryRun: boolean)
 
 	const plans: Plan[] = [];
 	const skipped: string[] = [];
-	for (const planned of [
-		planSettings(settingsPath, EXTENSION_ENTRY),
-		planMcp(mcpPath, request, migrateOwnedPin),
-		planGitignore(ignorePath),
-	]) {
+	for (const planned of [planMcp(mcpPath, request, migrateOwnedPin), planGitignore(ignorePath)]) {
 		if (typeof planned === "string") skipped.push(planned);
 		else plans.push(planned);
 	}
 
 	for (const note of skipped) process.stdout.write(`already done: ${note}\n`);
 	for (const plan of plans) process.stdout.write(`${plan.existed ? "update" : "create"} ${plan.path}: ${plan.change}\n`);
-	if (upgradeRecord) process.stdout.write(`update ${recordPath}: ${RECORD_SCHEMA_V1} → ${RECORD_SCHEMA}\n`);
-	if (plans.length === 0 && !upgradeRecord) {
+	if (upgradeFrom) process.stdout.write(`update ${recordPath}: ${upgradeFrom} → ${RECORD_SCHEMA}\n`);
+	if (plans.length === 0 && !upgradeFrom) {
 		process.stdout.write("nothing to do\n");
 		return;
 	}
@@ -547,7 +528,6 @@ function install(projectDir: string, requested: InstallRequest, dryRun: boolean)
 		mode: request.mode,
 		serverName: request.serverName,
 		...(request.mode === "pinned" ? { profile: request.profile as string } : {}),
-		extensionEntry: EXTENSION_ENTRY,
 		files,
 	};
 	writeAtomic(recordPath, asJson(record));
@@ -584,6 +564,8 @@ function undo(path: string, state: FileRecord, record: InstallRecord): { body: s
 		return { body: asJson({ ...current, mcpServers: servers }), emptied };
 	}
 
+	// Only a v1 or v2 record reaches here, and reading one guarantees it names
+	// the entry that version of the installer added to settings.json.
 	const configured = (current as SettingsFile).extensions;
 	const extensions = (Array.isArray(configured) ? configured : []).filter((value) => value !== record.extensionEntry);
 	const emptied = extensions.length === 0 && Object.keys(current).length === 1;
@@ -597,11 +579,13 @@ function rollback(projectDir: string, dryRun: boolean): void {
 	const ompDir = join(project, ".omp");
 	const recordPath = join(ompDir, RECORD_FILE);
 	if (!existsSync(recordPath)) fail(`no install record at ${recordPath}; nothing this tool installed`);
-	const { record } = readInstallRecord(recordPath);
+	const record = readInstallRecord(recordPath);
 
 	// The record is a file on disk like any other: it says what to undo, it does
 	// not get to say where. Only this project's own config files are in scope,
 	// and they are re-checked for symlinks and containment before being written.
+	// `settings.json` is still one of them: a v1 or v2 record put an extension
+	// entry there, and this is what takes it back out.
 	const inScope = [join(ompDir, "settings.json"), join(ompDir, "mcp.json"), join(ompDir, ".gitignore")];
 
 	const actions: (() => void)[] = [];
@@ -635,7 +619,7 @@ function rollback(projectDir: string, dryRun: boolean): void {
 	}
 	for (const act of actions) act();
 	unlinkSync(recordPath);
-	process.stdout.write(`removed ${recordPath}\ndone. ${project} no longer starts a Mattermost listener.\n`);
+	process.stdout.write(`removed ${recordPath}\ndone. ${project} is no longer wired to Mattermost.\n`);
 }
 
 const args = process.argv.slice(2);
